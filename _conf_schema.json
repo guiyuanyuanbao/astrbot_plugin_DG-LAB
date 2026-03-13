@@ -1,0 +1,64 @@
+{
+  "ws_host": {
+    "description": "WebSocket 服务监听地址",
+    "type": "string",
+    "default": "0.0.0.0",
+    "hint": "WS 服务监听的 IP 地址，0.0.0.0 表示监听所有网卡"
+  },
+  "ws_port": {
+    "description": "WebSocket 服务端口",
+    "type": "int",
+    "default": 5555,
+    "hint": "WS 服务监听的端口号"
+  },
+  "ws_external_host": {
+    "description": "外部访问地址(IP)",
+    "type": "string",
+    "default": "127.0.0.1",
+    "hint": "生成二维码时使用的地址，需要填写 APP 能够访问到的 IP 地址（如局域网 IP 或公网 IP）",
+    "obvious_hint": true
+  },
+  "max_strength_a": {
+    "description": "A 通道最大强度",
+    "type": "int",
+    "default": 100,
+    "hint": "A 通道允许的最大强度值 (0-200)，大模型设置强度时不会超过此值"
+  },
+  "max_strength_b": {
+    "description": "B 通道最大强度",
+    "type": "int",
+    "default": 100,
+    "hint": "B 通道允许的最大强度值 (0-200)，大模型设置强度时不会超过此值"
+  },
+  "dglab_persona_id": {
+    "description": "郊狼人格 ID",
+    "type": "string",
+    "default": "dglab_persona_shared",
+    "hint": "郊狼模式使用的共享人格 ID。建议仅使用字母、数字和下划线。"
+  },
+  "dglab_persona_system_prompt": {
+    "description": "郊狼人格系统提示词",
+    "type": "text",
+    "default": "你是一个郊狼脉冲主机的控制者。你可以通过工具调整设备的波形和强度来与用户互动。\n\n规则：\n1. 你可以根据对话内容自主决定何时调整强度和波形，让体验更加丰富有趣。\n2. 强度调整应该循序渐进，不要突然设置过高的强度。建议从低强度开始，逐渐增加。\n3. 当用户表示不适、疼痛或要求停止时，应立即调用停止工具将强度归零。\n4. 你可以组合使用不同的波形来创造层次丰富的体验。\n5. 在调整之前，先通过获取状态工具了解当前的通道配置和强度。\n6. 注意用户设置的通道和部位信息，只操作用户启用的通道。\n7. 你应当主动、有创意地使用这些工具，不需要每次都询问用户是否要调整。\n8. 安全第一：永远不要设置超过配置最大值的强度。",
+    "hint": "用于创建/更新郊狼人格的 system_prompt。留空则不创建也不切换郊狼人格。"
+  },
+  "dglab_persona_begin_dialogs": {
+    "description": "郊狼人格预设对话",
+    "type": "list",
+    "default": [],
+    "hint": "人格 begin_dialogs，需按 user/assistant 交替填写，条目数必须为偶数。"
+  },
+  "dglab_persona_error_reply": {
+    "description": "郊狼人格异常回复文案",
+    "type": "string",
+    "default": "郊狼模式开启失败：无法创建并切换郊狼人格，请检查人格配置。",
+    "hint": "当人格创建或切换失败时返回给用户的自定义提示。"
+  },
+  "dglab_default_persona_id": {
+    "description": "退出郊狼后默认恢复人格",
+    "type": "string",
+    "default": "",
+    "hint": "当进入前原人格为空时，退出郊狼后恢复到该人格 ID。留空则恢复为系统默认。",
+    "_special": "select_persona"
+  }
+}
