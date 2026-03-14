@@ -28,6 +28,7 @@ class DGLabSession:
         self.channel_b_part: str = ""  # B通道连接的部位
         self.original_persona_id: Optional[str] = None  # 进入郊狼模式前的人格 ID
         self.dglab_persona_id: Optional[str] = None  # 当前使用的郊狼共享人格 ID
+        self.bound_conversation_id: Optional[str] = None  # 绑定郊狼模式时的对话 ID
         self._wave_task: Optional[asyncio.Task] = None
 
     def get_status_desc(self) -> str:
@@ -151,9 +152,26 @@ class DGLabPlugin(Star):
         if not umo:
             return None
         session = await self._get_session(umo)
-        if session and session.active:
-            return session
-        return None
+        if not session or not session.active:
+            return None
+
+        # 使用对话管理器校验：仅允许绑定时所在对话调用该会话设备。
+        try:
+            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(umo)
+        except Exception as e:
+            logger.warning(f"获取当前对话 ID 失败，拒绝 tool 调用: {e}")
+            return None
+
+        if session.bound_conversation_id and curr_cid != session.bound_conversation_id:
+            logger.warning(
+                f"检测到跨对话 tool 调用，已拒绝。umo={umo}, current_cid={curr_cid}, bound_cid={session.bound_conversation_id}"
+            )
+            return None
+
+        if not session.bound_conversation_id and curr_cid:
+            session.bound_conversation_id = curr_cid
+
+        return session
 
     async def _ensure_server(self):
         """确保 WS 服务已启动"""
@@ -422,6 +440,12 @@ class DGLabPlugin(Star):
             # 保存原人格并按配置创建/切换郊狼人格。
             # 配置为空时按 _conf_schema 约定不切换人格。
             curr_cid, conv = await self._get_current_conversation(umo)
+            if not curr_cid:
+                conv_mgr = self.context.conversation_manager
+                curr_cid = await conv_mgr.new_conversation(unified_msg_origin=umo)
+                conv = await conv_mgr.get_conversation(umo, curr_cid)
+
+            session.bound_conversation_id = curr_cid
             if conv:
                 session.original_persona_id = conv.persona_id
 
