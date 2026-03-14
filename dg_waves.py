@@ -166,6 +166,10 @@ WAVE_NAME_MAP = {
     "rhythm_step": "节奏步伐",
 }
 
+# 反向映射
+WAVE_NAME_MAP_REVERSE = {v: k for k, v in WAVE_NAME_MAP.items()}
+
+
 def get_wave_names() -> list[str]:
     """获取所有波形名称（英文名）"""
     return list(WAVE_NAME_MAP.keys())
@@ -175,11 +179,11 @@ def get_wave_data(name: str) -> list[str]:
     """根据名称获取波形数据，支持中英文名"""
     # 先尝试中文名
     if name in WAVE_PRESETS:
-        return list(WAVE_PRESETS[name])
+        return WAVE_PRESETS[name]
     # 尝试英文名
     cn_name = WAVE_NAME_MAP.get(name)
     if cn_name and cn_name in WAVE_PRESETS:
-        return list(WAVE_PRESETS[cn_name])
+        return WAVE_PRESETS[cn_name]
     return []
 
 
