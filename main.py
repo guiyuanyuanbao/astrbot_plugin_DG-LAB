@@ -329,7 +329,7 @@ class DGLabPlugin(Star):
         except Exception as e:
             logger.error(f"删除人格失败({persona_id}): {e}")
 
-    @filter.command_group("dglab", alias={"郊狼"})
+    @filter.command_group("dglab")
     def dglab_group(self):
         """郊狼指令组"""
         pass
