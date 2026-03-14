@@ -14,9 +14,6 @@ import astrbot.api.message_components as Comp
 from .dg_server import DGLabWSServer, DGLabController
 from .dg_waves import WAVE_PRESETS, WAVE_NAME_MAP, get_wave_data, get_wave_descriptions, get_wave_names
 
-# 每个会话(unified_msg_origin)的郊狼模式状态
-_sessions: dict[str, "DGLabSession"] = {}
-
 
 class DGLabSession:
     """单个聊天会话的郊狼模式状态"""
@@ -79,13 +76,84 @@ class DGLabPlugin(Star):
         self._dglab_tools_registered = False
         self._current_tools = []
         self._shared_dglab_persona_id: Optional[str] = None
+        self._sessions: dict[str, DGLabSession] = {}
+        self._sessions_lock = asyncio.Lock()
 
     async def initialize(self):
         """插件初始化（WS 服务按郊狼模式启停）"""
         return
 
-    def _has_active_sessions(self) -> bool:
-        return any(session.active for session in _sessions.values())
+    async def _has_active_sessions(self) -> bool:
+        async with self._sessions_lock:
+            return any(session.active for session in self._sessions.values())
+
+    async def _get_sessions_snapshot(self) -> list[DGLabSession]:
+        async with self._sessions_lock:
+            return list(self._sessions.values())
+
+    async def _get_session(self, umo: str) -> Optional[DGLabSession]:
+        async with self._sessions_lock:
+            return self._sessions.get(umo)
+
+    async def _set_session(self, umo: str, session: DGLabSession):
+        async with self._sessions_lock:
+            self._sessions[umo] = session
+
+    async def _pop_session(self, umo: str) -> Optional[DGLabSession]:
+        async with self._sessions_lock:
+            return self._sessions.pop(umo, None)
+
+    @staticmethod
+    def _extract_umo_from_tool_context(tool_context) -> Optional[str]:
+        nested_context = getattr(tool_context, "context", None)
+        if nested_context is not None:
+            tool_context = nested_context
+
+        candidates = [
+            "unified_msg_origin",
+            "event_unified_msg_origin",
+            "umo",
+        ]
+
+        for name in candidates:
+            value = getattr(tool_context, name, None)
+            if isinstance(value, str) and value:
+                return value
+
+        for event_attr in ("event", "message_event"):
+            event_obj = getattr(tool_context, event_attr, None)
+            if event_obj is None:
+                continue
+            value = getattr(event_obj, "unified_msg_origin", None)
+            if isinstance(value, str) and value:
+                return value
+
+        meta = getattr(tool_context, "metadata", None)
+        if isinstance(meta, dict):
+            value = meta.get("unified_msg_origin") or meta.get("umo")
+            if isinstance(value, str) and value:
+                return value
+            event_meta = meta.get("event") or meta.get("message_event")
+            if isinstance(event_meta, dict):
+                value = event_meta.get("unified_msg_origin")
+                if isinstance(value, str) and value:
+                    return value
+
+        if isinstance(tool_context, dict):
+            value = tool_context.get("unified_msg_origin") or tool_context.get("umo")
+            if isinstance(value, str) and value:
+                return value
+
+        return None
+
+    async def get_tool_session(self, tool_context) -> Optional[DGLabSession]:
+        umo = self._extract_umo_from_tool_context(tool_context)
+        if not umo:
+            return None
+        session = await self._get_session(umo)
+        if session and session.active:
+            return session
+        return None
 
     async def _ensure_server(self):
         """确保 WS 服务已启动"""
@@ -103,7 +171,7 @@ class DGLabPlugin(Star):
     async def _stop_server_if_idle(self):
         """没有活跃会话时关闭 WS 服务"""
         async with self._server_lock:
-            if self._has_active_sessions():
+            if await self._has_active_sessions():
                 return
             if self._ws_server and self._server_started:
                 await self._ws_server.stop()
@@ -112,7 +180,7 @@ class DGLabPlugin(Star):
 
     async def _on_strength_update(self, client_id: str, target_id: str, message: str):
         """APP 上报强度数据的回调"""
-        for session in _sessions.values():
+        for session in await self._get_sessions_snapshot():
             if session.controller and session.active:
                 ctrl = session.controller
                 # 协议里上报强度时的 clientId/targetId 方向在不同实现里可能互换，
@@ -122,7 +190,7 @@ class DGLabPlugin(Star):
 
     async def _on_bind(self, client_id: str, target_id: str):
         """绑定成功回调"""
-        for session in _sessions.values():
+        for session in await self._get_sessions_snapshot():
             if session.controller and session.controller.client_id == client_id:
                 session.controller.set_bound(target_id)
                 # 通知用户
@@ -135,7 +203,7 @@ class DGLabPlugin(Star):
 
     async def _on_disconnect(self, disconnected_id: str):
         """断开连接回调"""
-        for session in _sessions.values():
+        for session in await self._get_sessions_snapshot():
             if session.controller and session.active:
                 ctrl = session.controller
                 if ctrl.client_id == disconnected_id or ctrl.target_id == disconnected_id:
@@ -221,11 +289,11 @@ class DGLabPlugin(Star):
 
     async def _delete_shared_dglab_persona_if_idle(self):
         """没有活跃会话时删除郊狼共享人格"""
-        if self._has_active_sessions():
+        if await self._has_active_sessions():
             return
 
         async with self._persona_lock:
-            if self._has_active_sessions():
+            if await self._has_active_sessions():
                 return
             if self._shared_dglab_persona_id:
                 await self._delete_persona_if_exists(self._shared_dglab_persona_id)
@@ -267,7 +335,7 @@ class DGLabPlugin(Star):
     async def dglab_persona(self, event: AstrMessageEvent):
         """查看郊狼人格配置与当前状态"""
         umo = event.unified_msg_origin
-        session = _sessions.get(umo)
+        session = await self._get_session(umo)
 
         configured_id = (self._dglab_persona_id or "").strip() or "(未配置)"
         enabled = "是" if self._is_persona_enabled() else "否"
@@ -299,7 +367,8 @@ class DGLabPlugin(Star):
         """开启郊狼模式，生成二维码供 APP 扫描绑定"""
         umo = event.unified_msg_origin
 
-        if umo in _sessions and _sessions[umo].active:
+        existing_session = await self._get_session(umo)
+        if existing_session and existing_session.active:
             yield event.plain_result("郊狼模式已经开启，请先使用 /dglab stop 退出后再重新开启。")
             return
 
@@ -317,44 +386,46 @@ class DGLabPlugin(Star):
         session = DGLabSession(umo)
         session.ws_server = self._ws_server
         session.active = True
-
-        # 创建控制器
-        controller = DGLabController(self._ws_server)
-        await controller.connect_as_client()
-        # 将控制器的 client_id 注册到 ws_server 的 clients 列表中（不通过真正的 ws 连接）
-        # 这里我们不需要为控制器创建实际的 ws 连接，因为控制器直接通过 ws_server 发送
-        session.controller = controller
-
-        # 生成二维码
-        qr_url = controller.get_qrcode_url(self._ws_external_host, self._ws_port)
+        qr_path = None
+        controller = None
 
         try:
-            import qrcode
-            qr = qrcode.QRCode(version=1, box_size=10, border=5)
-            qr.add_data(qr_url)
-            qr.make(fit=True)
-            img = qr.make_image(fill_color="black", back_color="white")
-            img_bytes = io.BytesIO()
-            img.save(img_bytes, format="PNG")
-            img_bytes.seek(0)
+            # 创建控制器
+            controller = DGLabController(self._ws_server)
+            await controller.connect_as_client()
+            # 将控制器的 client_id 注册到 ws_server 的 clients 列表中（不通过真正的 ws 连接）
+            # 这里我们不需要为控制器创建实际的 ws 连接，因为控制器直接通过 ws_server 发送
+            session.controller = controller
 
-            # 保存为临时文件
-            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-            tmp.write(img_bytes.getvalue())
-            tmp.close()
-            qr_path = tmp.name
-        except ImportError:
-            qr_path = None
-            logger.warning("qrcode 库未安装，无法生成二维码图片")
+            # 生成二维码
+            qr_url = controller.get_qrcode_url(self._ws_external_host, self._ws_port)
 
-        # 保存原人格并按配置创建/切换郊狼人格。
-        # 配置为空时按 _conf_schema 约定不切换人格。
-        curr_cid, conv = await self._get_current_conversation(umo)
-        if conv:
-            session.original_persona_id = conv.persona_id
-
-        if self._is_persona_enabled():
             try:
+                import qrcode
+                qr = qrcode.QRCode(version=1, box_size=10, border=5)
+                qr.add_data(qr_url)
+                qr.make(fit=True)
+                img = qr.make_image(fill_color="black", back_color="white")
+                img_bytes = io.BytesIO()
+                img.save(img_bytes, format="PNG")
+                img_bytes.seek(0)
+
+                # 保存为临时文件
+                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                tmp.write(img_bytes.getvalue())
+                tmp.close()
+                qr_path = tmp.name
+            except ImportError:
+                qr_path = None
+                logger.warning("qrcode 库未安装，无法生成二维码图片")
+
+            # 保存原人格并按配置创建/切换郊狼人格。
+            # 配置为空时按 _conf_schema 约定不切换人格。
+            curr_cid, conv = await self._get_current_conversation(umo)
+            if conv:
+                session.original_persona_id = conv.persona_id
+
+            if self._is_persona_enabled():
                 dglab_persona_id = await self._ensure_shared_dglab_persona()
                 session.dglab_persona_id = dglab_persona_id
 
@@ -365,26 +436,38 @@ class DGLabPlugin(Star):
                         conversation_id=curr_cid,
                         persona_id=dglab_persona_id,
                     )
-            except Exception as e:
-                logger.error(f"配置郊狼人格失败: {e}")
-                # 回滚控制器注册
-                if self._ws_server and controller.client_id:
-                    self._ws_server.clients.pop(controller.client_id, None)
-                    self._ws_server.relations.pop(controller.client_id, None)
-                # 无活跃会话时关闭服务器
-                if not self._has_active_sessions():
-                    await self._stop_server_if_idle()
-                custom_error = (self._dglab_persona_error_reply or "").strip()
-                if custom_error:
-                    yield event.plain_result(f"{custom_error}\n错误详情：{str(e)}")
-                else:
-                    yield event.plain_result(f"郊狼模式开启失败：无法创建并切换郊狼人格，错误：{str(e)}")
-                return
 
-        # 注册 LLM Tools
-        self._register_tools(session)
+            # 注册 LLM Tools
+            self._register_tools(session)
 
-        _sessions[umo] = session
+            await self._set_session(umo, session)
+
+        except Exception as e:
+            logger.error(f"郊狼模式开启流程失败: {e}")
+            # 回滚控制器注册，避免残留虚拟客户端
+            if self._ws_server and controller and controller.client_id:
+                self._ws_server.clients.pop(controller.client_id, None)
+                self._ws_server.relations.pop(controller.client_id, None)
+            session.active = False
+
+            # 若没有其他活跃会话，回收服务与共享人格
+            if not await self._has_active_sessions():
+                self._unregister_tools()
+                await self._stop_server_if_idle()
+                await self._delete_shared_dglab_persona_if_idle()
+
+            if qr_path:
+                try:
+                    os.unlink(qr_path)
+                except Exception:
+                    pass
+
+            custom_error = (self._dglab_persona_error_reply or "").strip()
+            if custom_error:
+                yield event.plain_result(f"{custom_error}\n错误详情：{str(e)}")
+            else:
+                yield event.plain_result(f"郊狼模式开启失败：{str(e)}")
+            return
 
         # 发送二维码
         if qr_path:
@@ -409,7 +492,7 @@ class DGLabPlugin(Star):
     async def dglab_stop(self, event: AstrMessageEvent):
         """退出郊狼模式"""
         umo = event.unified_msg_origin
-        session = _sessions.get(umo)
+        session = await self._get_session(umo)
 
         if not session or not session.active:
             yield event.plain_result("当前未开启郊狼模式。")
@@ -454,10 +537,10 @@ class DGLabPlugin(Star):
             logger.error(f"恢复人格失败: {e}")
 
         session.active = False
-        _sessions.pop(umo, None)
+        await self._pop_session(umo)
 
         # 仅当没有活跃会话时卸载工具、停服并删除共享人格
-        if not self._has_active_sessions():
+        if not await self._has_active_sessions():
             self._unregister_tools()
             await self._stop_server_if_idle()
             await self._delete_shared_dglab_persona_if_idle()
@@ -468,7 +551,7 @@ class DGLabPlugin(Star):
     async def dglab_channel(self, event: AstrMessageEvent, channel: str = "AB"):
         """设置使用的通道。参数: A / B / AB"""
         umo = event.unified_msg_origin
-        session = _sessions.get(umo)
+        session = await self._get_session(umo)
 
         if not session or not session.active:
             yield event.plain_result("请先使用 /dglab 开启郊狼模式。")
@@ -486,7 +569,7 @@ class DGLabPlugin(Star):
     async def dglab_part(self, event: AstrMessageEvent):
         """设置通道连接的部位。格式: /dglab part A:大腿 B:手臂"""
         umo = event.unified_msg_origin
-        session = _sessions.get(umo)
+        session = await self._get_session(umo)
 
         if not session or not session.active:
             yield event.plain_result("请先使用 /dglab 开启郊狼模式。")
@@ -525,7 +608,7 @@ class DGLabPlugin(Star):
     async def dglab_status(self, event: AstrMessageEvent):
         """查看郊狼模式状态"""
         umo = event.unified_msg_origin
-        session = _sessions.get(umo)
+        session = await self._get_session(umo)
 
         if not session or not session.active:
             yield event.plain_result("郊狼模式未开启。使用 /dglab 开启。")
@@ -557,24 +640,17 @@ class DGLabPlugin(Star):
             self._current_tools = []
         self._dglab_tools_registered = False
 
-    def get_session_for_event(self, event_umo: str) -> Optional[DGLabSession]:
+    async def get_session_for_event(self, event_umo: str) -> Optional[DGLabSession]:
         """获取事件对应的郊狼会话"""
-        session = _sessions.get(event_umo)
+        session = await self._get_session(event_umo)
         if session and session.active:
             return session
-        return None
-
-    def get_any_active_session(self) -> Optional[DGLabSession]:
-        """获取任意一个活跃的郊狼会话"""
-        for session in _sessions.values():
-            if session.active and session.controller and session.controller.is_bound:
-                return session
         return None
 
     async def terminate(self):
         """插件销毁"""
         # 关闭所有 session
-        for umo, session in list(_sessions.items()):
+        for session in await self._get_sessions_snapshot():
             if session._wave_task and not session._wave_task.done():
                 session._wave_task.cancel()
                 try:
@@ -592,7 +668,8 @@ class DGLabPlugin(Star):
                 except Exception:
                     pass
             session.active = False
-        _sessions.clear()
+        async with self._sessions_lock:
+            self._sessions.clear()
 
         # 取消注册 tools
         self._unregister_tools()

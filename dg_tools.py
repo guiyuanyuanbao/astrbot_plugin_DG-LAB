@@ -54,6 +54,14 @@ def _get_plugin():
     return _plugin_ref
 
 
+async def _get_tool_session(plugin, context):
+    """根据 tool 执行上下文定位当前会话，避免跨会话误控。"""
+    session = await plugin.get_tool_session(context)
+    if session:
+        return session, None
+    return None, "错误：未找到当前会话对应的郊狼模式，或会话未激活。请在当前会话先执行 /dglab start 并完成绑定。"
+
+
 @dataclass
 class DGLabSetStrengthTool(FunctionTool[AstrAgentContext]):
     """设置郊狼设备的通道强度"""
@@ -100,9 +108,9 @@ class DGLabSetStrengthTool(FunctionTool[AstrAgentContext]):
         mode = kwargs.get("mode", "set")
         value = int(kwargs.get("value", 0))
 
-        session = plugin.get_any_active_session()
+        session, session_err = await _get_tool_session(plugin, context)
         if not session:
-            return "错误：当前没有活跃的郊狼会话，设备未连接。无法执行操作。"
+            return session_err
 
         if not session.controller or not session.controller.is_bound:
             return "错误：设备未绑定，请先让用户扫码绑定 APP。"
@@ -179,9 +187,9 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
         wave_name = kwargs.get("wave_name", "breathe")
         duration = min(float(kwargs.get("duration_seconds", 5)), 30)
 
-        session = plugin.get_any_active_session()
+        session, session_err = await _get_tool_session(plugin, context)
         if not session:
-            return "错误：当前没有活跃的郊狼会话，设备未连接。无法执行操作。"
+            return session_err
 
         if not session.controller or not session.controller.is_bound:
             return "错误：设备未绑定，请先让用户扫码绑定 APP。"
@@ -266,9 +274,9 @@ class DGLabGetStatusTool(FunctionTool[AstrAgentContext]):
         if not plugin:
             return "错误：插件未初始化。"
 
-        session = plugin.get_any_active_session()
+        session, session_err = await _get_tool_session(plugin, context)
         if not session:
-            return "错误：当前没有活跃的郊狼会话，设备未连接。"
+            return session_err
 
         ctrl = session.controller
         info = []
@@ -319,9 +327,9 @@ class DGLabClearWaveTool(FunctionTool[AstrAgentContext]):
 
         channel = kwargs.get("channel", "A").upper()
 
-        session = plugin.get_any_active_session()
+        session, session_err = await _get_tool_session(plugin, context)
         if not session:
-            return "错误：当前没有活跃的郊狼会话，设备未连接。"
+            return session_err
 
         if not session.controller or not session.controller.is_bound:
             return "错误：设备未绑定。"
@@ -361,9 +369,9 @@ class DGLabStopOutputTool(FunctionTool[AstrAgentContext]):
         if not plugin:
             return "错误：插件未初始化。"
 
-        session = plugin.get_any_active_session()
+        session, session_err = await _get_tool_session(plugin, context)
         if not session:
-            return "错误：当前没有活跃的郊狼会话，设备未连接。"
+            return session_err
 
         if not session.controller or not session.controller.is_bound:
             return "错误：设备未绑定。"
