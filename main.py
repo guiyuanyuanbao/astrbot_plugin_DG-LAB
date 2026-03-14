@@ -28,6 +28,9 @@ class DGLabSession:
         self.dglab_persona_id: Optional[str] = None  # 当前使用的郊狼共享人格 ID
         self.bound_conversation_id: Optional[str] = None  # 绑定郊狼模式时的对话 ID
         self._wave_task: Optional[asyncio.Task] = None
+        self.quick_fire_boost_a: int = 1  # 一键开火 A 通道临时增量
+        self.quick_fire_boost_b: int = 1  # 一键开火 B 通道临时增量
+        self._quick_fire_restore_task: Optional[asyncio.Task] = None
 
     def get_status_desc(self) -> str:
         """获取当前会话状态描述"""
@@ -48,7 +51,7 @@ class DGLabSession:
         return " | ".join(parts)
 
 
-@register("astrbot_plugin_dglab", "YourName", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.0")
+@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.1")
 class DGLabPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -342,10 +345,93 @@ class DGLabPlugin(Star):
             "/dglab status - 查看当前郊狼状态\n"
             "/dglab channel A|B|AB - 设置使用通道\n"
             "/dglab part A:部位 B:部位 - 设置通道部位\n"
+            "/dglab fire [强度] 或 /dglab fire A:强度 B:强度 - 设置一键开火临时增量(默认1, 最大30)\n"
             "/dglab persona - 查看当前郊狼人格配置与状态\n"
             "/dglab help - 查看本帮助"
         )
         yield event.plain_result(help_text)
+
+    @dglab_group.command("fire")
+    async def dglab_set_quick_fire_boost(self, event: AstrMessageEvent):
+        """设置一键开火的临时增量。用法: /dglab fire 10 或 /dglab fire A:8 B:12"""
+        umo = event.unified_msg_origin
+        session = await self._get_session(umo)
+
+        if not session or not session.active:
+            yield event.plain_result("请先使用 /dglab start 开启郊狼模式后再设置一键开火强度。")
+            return
+
+        text = event.message_str.strip()
+        for prefix in ("/dglab fire", "dglab fire"):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                break
+
+        # 空参数时重置为默认值
+        if not text:
+            session.quick_fire_boost_a = 1
+            session.quick_fire_boost_b = 1
+            yield event.plain_result("一键开火增量已重置为默认值: A=1, B=1")
+            return
+
+        # 支持格式:
+        # 1) /dglab fire 10               -> AB 都设为 10
+        # 2) /dglab fire A:8 B:12         -> 分通道设置
+        # 3) /dglab fire A 8 B 12         -> 分通道设置
+        parts = text.replace("：", ":").split()
+
+        def _clamp_boost(v: int) -> int:
+            return max(1, min(30, v))
+
+        try:
+            if len(parts) == 1 and ":" not in parts[0]:
+                value = _clamp_boost(int(parts[0]))
+                session.quick_fire_boost_a = value
+                session.quick_fire_boost_b = value
+            else:
+                idx = 0
+                set_a = False
+                set_b = False
+                while idx < len(parts):
+                    token = parts[idx]
+                    if ":" in token:
+                        ch, raw = token.split(":", 1)
+                        ch = ch.strip().upper()
+                        value = _clamp_boost(int(raw.strip()))
+                        if ch == "A":
+                            session.quick_fire_boost_a = value
+                            set_a = True
+                        elif ch == "B":
+                            session.quick_fire_boost_b = value
+                            set_b = True
+                        else:
+                            raise ValueError("通道只能是 A 或 B")
+                        idx += 1
+                        continue
+
+                    ch = token.strip().upper()
+                    if ch not in ("A", "B") or idx + 1 >= len(parts):
+                        raise ValueError("参数格式错误")
+                    value = _clamp_boost(int(parts[idx + 1]))
+                    if ch == "A":
+                        session.quick_fire_boost_a = value
+                        set_a = True
+                    else:
+                        session.quick_fire_boost_b = value
+                        set_b = True
+                    idx += 2
+
+                if not set_a and not set_b:
+                    raise ValueError("未解析到有效通道参数")
+        except ValueError:
+            yield event.plain_result(
+                "格式错误。请使用: /dglab fire 10 或 /dglab fire A:8 B:12 (范围 1-30)。"
+            )
+            return
+
+        yield event.plain_result(
+            f"一键开火增量已设置: A={session.quick_fire_boost_a}, B={session.quick_fire_boost_b}"
+        )
 
     @dglab_group.command("persona", alias={"人格"})
     async def dglab_persona(self, event: AstrMessageEvent):
@@ -538,6 +624,16 @@ class DGLabPlugin(Star):
 
         # 断开控制器连接
         if session.controller:
+            if session._quick_fire_restore_task and not session._quick_fire_restore_task.done():
+                session._quick_fire_restore_task.cancel()
+                try:
+                    await session._quick_fire_restore_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"停止会话一键开火恢复任务时出现异常: {e}")
+            session._quick_fire_restore_task = None
+
             if session._wave_task and not session._wave_task.done():
                 session._wave_task.cancel()
                 try:
@@ -689,6 +785,16 @@ class DGLabPlugin(Star):
         """插件销毁"""
         # 关闭所有 session
         for session in await self._get_sessions_snapshot():
+            if session._quick_fire_restore_task and not session._quick_fire_restore_task.done():
+                session._quick_fire_restore_task.cancel()
+                try:
+                    await session._quick_fire_restore_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"terminate 时停止一键开火恢复任务异常: {e}")
+            session._quick_fire_restore_task = None
+
             if session._wave_task and not session._wave_task.done():
                 session._wave_task.cancel()
                 try:

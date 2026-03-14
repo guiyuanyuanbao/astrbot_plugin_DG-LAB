@@ -40,6 +40,7 @@ def create_dglab_tools(plugin) -> list:
     tools = [
         DGLabSetStrengthTool(),
         DGLabSendWaveTool(),
+        DGLabQuickFireTool(),
         DGLabGetStatusTool(),
         DGLabClearWaveTool(),
         DGLabStopOutputTool(),
@@ -154,7 +155,7 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
     description: str = (
         "向 DG-Lab 郊狼设备的指定通道发送预设波形数据。"
         f"可用波形列表:\n{get_wave_descriptions()}\n"
-        "wave_name 使用英文名。duration_seconds 控制波形持续发送的秒数（波形会循环发送）。"
+        "wave_name 使用英文名。duration_seconds 控制波形持续发送的秒数（波形会循环发送,可在还有波形时发送新波形,会覆盖旧波形）。"
         "注意：只有在郊狼模式开启且设备已绑定时才能使用。"
     )
     parameters: dict = Field(
@@ -172,7 +173,7 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
                 },
                 "duration_seconds": {
                     "type": "number",
-                    "description": "波形持续发送的总时长（秒），默认 5 秒，最大 30 秒",
+                    "description": "波形持续发送的总时长（秒），默认 5 秒，最大 120 秒",
                 },
             },
             "required": ["channel", "wave_name"],
@@ -196,7 +197,7 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
 
         if duration <= 0:
             return "错误：duration_seconds 必须大于 0。"
-        duration = min(duration, 30)
+        duration = min(duration, 120)
 
         session, session_err = await _get_tool_session(plugin, context)
         if not session:
@@ -259,6 +260,123 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
             return f"已向 {channel} 通道{part_info}发送波形 '{cn_name}'，持续约 {duration} 秒。"
         except Exception as e:
             return f"发送波形失败: {str(e)}"
+
+
+@dataclass
+class DGLabQuickFireTool(FunctionTool[AstrAgentContext]):
+    """一键开火：按配置临时提高当前强度并自动恢复"""
+
+    name: str = "dglab_quick_fire"
+    description: str = (
+        "一键开火：在当前强度基础上临时增加指定通道强度，并在 duration_seconds 后恢复到原强度。"
+        "增量由 /dglab fire 命令配置，默认 A=1、B=1，最大 30。"
+        "channel 支持 A/B/AB。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "目标通道，A/B/AB，默认 AB",
+                    "enum": ["A", "B", "AB"],
+                },
+                "duration_seconds": {
+                    "type": "number",
+                    "description": "持续时间（秒），默认 2 秒，最大 30 秒",
+                },
+            },
+            "required": [],
+        }
+    )
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        plugin = _get_plugin_from_tool(self)
+        if not plugin:
+            return "错误：插件未初始化。"
+
+        channel = str(kwargs.get("channel", "AB")).upper()
+        if channel not in ("A", "B", "AB"):
+            return "错误：channel 仅支持 A、B 或 AB。"
+
+        try:
+            duration = float(kwargs.get("duration_seconds", 2))
+        except (TypeError, ValueError):
+            return "错误：duration_seconds 必须是数字。"
+
+        if duration <= 0:
+            return "错误：duration_seconds 必须大于 0。"
+        duration = min(duration, 30)
+
+        session, session_err = await _get_tool_session(plugin, context)
+        if not session:
+            return session_err
+
+        if not session.controller or not session.controller.is_bound:
+            return "错误：设备未绑定，请先让用户扫码绑定 APP。"
+
+        ctrl = session.controller
+
+        # 若存在旧恢复任务，取消它，避免恢复顺序冲突。
+        old_restore_task = getattr(session, "_quick_fire_restore_task", None)
+        if old_restore_task and not old_restore_task.done():
+            old_restore_task.cancel()
+            try:
+                await old_restore_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as ex:
+                logger.warning(f"取消旧一键开火恢复任务异常: {ex}")
+
+        original_a = int(ctrl.strength_a)
+        original_b = int(ctrl.strength_b)
+
+        boost_a = max(1, min(30, int(getattr(session, "quick_fire_boost_a", 1))))
+        boost_b = max(1, min(30, int(getattr(session, "quick_fire_boost_b", 1))))
+
+        targets = []
+        if channel in ("A", "AB"):
+            if "A" not in session.channel_config:
+                return f"错误：用户未启用 A 通道，当前配置为 {session.channel_config} 通道。"
+            new_a = min(plugin._max_strength_a, original_a + boost_a)
+            targets.append((1, new_a))
+        if channel in ("B", "AB"):
+            if "B" not in session.channel_config:
+                return f"错误：用户未启用 B 通道，当前配置为 {session.channel_config} 通道。"
+            new_b = min(plugin._max_strength_b, original_b + boost_b)
+            targets.append((2, new_b))
+
+        try:
+            for ch, val in targets:
+                await ctrl.send_strength(ch, 2, val)
+
+            async def _restore_after_delay():
+                try:
+                    await asyncio.sleep(duration)
+                    if not ctrl.is_bound:
+                        return
+                    if channel in ("A", "AB"):
+                        await ctrl.send_strength(1, 2, original_a)
+                    if channel in ("B", "AB"):
+                        await ctrl.send_strength(2, 2, original_b)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    logger.warning(f"一键开火恢复失败: {ex}")
+                finally:
+                    if getattr(session, "_quick_fire_restore_task", None) is asyncio.current_task():
+                        session._quick_fire_restore_task = None
+
+            session._quick_fire_restore_task = asyncio.create_task(_restore_after_delay())
+
+            return (
+                f"一键开火已触发：通道 {channel}，持续 {duration} 秒。"
+                f"当前配置增量 A={boost_a}, B={boost_b}，结束后将恢复触发前强度。"
+            )
+        except Exception as e:
+            return f"一键开火执行失败: {str(e)}"
 
 
 @dataclass
