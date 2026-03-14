@@ -62,6 +62,11 @@ async def _get_tool_session(plugin, context):
     return None, "错误：未找到当前会话对应的郊狼模式，或会话未激活。请在当前会话先执行 /dglab start 并完成绑定。"
 
 
+def _get_channel_max_strength(plugin, channel: str) -> int:
+    """与 DGLabSetStrengthTool 一致的通道最大强度规则。"""
+    return plugin._max_strength_a if channel == "A" else plugin._max_strength_b
+
+
 @dataclass
 class DGLabSetStrengthTool(FunctionTool[AstrAgentContext]):
     """设置郊狼设备的通道强度"""
@@ -126,7 +131,7 @@ class DGLabSetStrengthTool(FunctionTool[AstrAgentContext]):
             return f"错误：用户未启用 B 通道，当前配置为 {session.channel_config} 通道。"
 
         # 限制最大强度
-        max_strength = plugin._max_strength_a if channel == "A" else plugin._max_strength_b
+        max_strength = _get_channel_max_strength(plugin, channel)
         value = max(0, min(value, max_strength))
 
         ch_num = 1 if channel == "A" else 2
@@ -333,19 +338,25 @@ class DGLabQuickFireTool(FunctionTool[AstrAgentContext]):
         original_a = int(ctrl.strength_a)
         original_b = int(ctrl.strength_b)
 
-        boost_a = max(1, min(30, int(getattr(session, "quick_fire_boost_a", 1))))
-        boost_b = max(1, min(30, int(getattr(session, "quick_fire_boost_b", 1))))
+        boost_a = max(0, min(30, int(getattr(session, "quick_fire_boost_a", 1))))
+        boost_b = max(0, min(30, int(getattr(session, "quick_fire_boost_b", 1))))
 
         targets = []
         if channel in ("A", "AB"):
             if "A" not in session.channel_config:
                 return f"错误：用户未启用 A 通道，当前配置为 {session.channel_config} 通道。"
-            new_a = min(plugin._max_strength_a, original_a + boost_a)
+            max_a = _get_channel_max_strength(plugin, "A")
+            new_a = min(max_a, original_a + boost_a)
+            # 若触发上限封顶，则将该通道一键开火增量回写为实际可增加值。
+            session.quick_fire_boost_a = max(0, min(30, new_a - original_a))
             targets.append((1, new_a))
         if channel in ("B", "AB"):
             if "B" not in session.channel_config:
                 return f"错误：用户未启用 B 通道，当前配置为 {session.channel_config} 通道。"
-            new_b = min(plugin._max_strength_b, original_b + boost_b)
+            max_b = _get_channel_max_strength(plugin, "B")
+            new_b = min(max_b, original_b + boost_b)
+            # 若触发上限封顶，则将该通道一键开火增量回写为实际可增加值。
+            session.quick_fire_boost_b = max(0, min(30, new_b - original_b))
             targets.append((2, new_b))
 
         try:
