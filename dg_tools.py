@@ -14,7 +14,96 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 
-from .dg_waves import get_wave_data, get_wave_names, get_wave_descriptions, WAVE_NAME_MAP
+from .dg_waves import (
+    get_wave_data,
+    get_wave_names,
+    get_wave_descriptions,
+    get_wave_model_reference_examples,
+    WAVE_NAME_MAP,
+)
+
+
+def _convert_wave_frequency(input_freq: int) -> int:
+    """将输入频率(10-1000)换算为协议频率字节值(10-240)。"""
+    if 10 <= input_freq <= 100:
+        return input_freq
+    if 101 <= input_freq <= 600:
+        return ((input_freq - 100) // 5) + 100
+    if 601 <= input_freq <= 1000:
+        return ((input_freq - 600) // 10) + 200
+    return 10
+
+
+def _frame_to_hex(freqs: list[int], strengths: list[int]) -> str:
+    """将单帧 4 组频率/强度数据编码为 8 字节 HEX。"""
+    freq_hex = "".join(f"{value:02X}" for value in freqs)
+    strength_hex = "".join(f"{value:02X}" for value in strengths)
+    return f"{freq_hex}{strength_hex}"
+
+
+def _build_custom_wave_data(frames: list[dict]) -> tuple[list[str], Optional[str]]:
+    """把自定义帧数据转换为协议波形数组，返回 (wave_data, error)。"""
+    if not isinstance(frames, list):
+        return [], "错误：frames 必须是数组。"
+    if not frames:
+        return [], "错误：frames 不能为空。"
+    if len(frames) > 100:
+        # 超过 100 帧时自动截断到 99 帧，而不是报错。
+        frames = frames[:99]
+
+    wave_data: list[str] = []
+
+    for index, frame in enumerate(frames, start=1):
+        if not isinstance(frame, dict):
+            return [], f"错误：frames[{index}] 必须是对象。"
+
+        freqs = frame.get("freqs")
+        strengths = frame.get("strengths")
+
+        if not isinstance(freqs, list) or len(freqs) != 4:
+            return [], f"错误：frames[{index}].freqs 必须是长度为 4 的数组。"
+        if not isinstance(strengths, list) or len(strengths) != 4:
+            return [], f"错误：frames[{index}].strengths 必须是长度为 4 的数组。"
+
+        converted_freqs: list[int] = []
+        converted_strengths: list[int] = []
+
+        for group_index in range(4):
+            raw_freq = freqs[group_index]
+            raw_strength = strengths[group_index]
+
+            if not isinstance(raw_freq, (int, float)):
+                return [], f"错误：frames[{index}].freqs[{group_index + 1}] 必须是数字。"
+            if not isinstance(raw_strength, (int, float)):
+                return [], f"错误：frames[{index}].strengths[{group_index + 1}] 必须是数字。"
+
+            input_freq = int(raw_freq)
+            input_strength = int(raw_strength)
+
+            if input_freq < 10 or input_freq > 1000:
+                return [], (
+                    f"错误：frames[{index}].freqs[{group_index + 1}]={input_freq} 超出范围，"
+                    "允许范围为 10-1000。"
+                )
+            if input_strength < 0 or input_strength > 100:
+                return [], (
+                    f"错误：frames[{index}].strengths[{group_index + 1}]={input_strength} 超出范围，"
+                    "允许范围为 0-100。"
+                )
+
+            converted_freq = _convert_wave_frequency(input_freq)
+            if converted_freq < 10 or converted_freq > 240:
+                return [], (
+                    f"错误：frames[{index}].freqs[{group_index + 1}] 换算后为 {converted_freq}，"
+                    "不在协议字节范围 10-240 内。"
+                )
+
+            converted_freqs.append(converted_freq)
+            converted_strengths.append(input_strength)
+
+        wave_data.append(_frame_to_hex(converted_freqs, converted_strengths))
+
+    return wave_data, None
 
 
 async def _cancel_session_wave_task(session) -> None:
@@ -40,6 +129,7 @@ def create_dglab_tools(plugin) -> list:
     tools = [
         DGLabSetStrengthTool(),
         DGLabSendWaveTool(),
+        DGLabSendCustomWaveTool(),
         DGLabQuickFireTool(),
         DGLabGetStatusTool(),
         DGLabClearWaveTool(),
@@ -168,7 +258,7 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
     description: str = (
         "向 DG-Lab 郊狼设备的指定通道发送预设波形数据。"
         f"可用波形列表:\n{get_wave_descriptions()}\n"
-        "wave_name 使用英文名。duration_seconds 控制波形持续发送的秒数（波形会循环发送,可在还有波形时发送新波形,会覆盖旧波形）。"
+        "wave_name 使用英文名。duration_seconds 控制波形持续发送的秒数（波形会循环发送,可在还有波形时发送新波形,会覆盖旧波形），取值范围 30-180 秒。"
         "注意：只有在郊狼模式开启且设备已绑定时才能使用。"
     )
     parameters: dict = Field(
@@ -186,7 +276,7 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
                 },
                 "duration_seconds": {
                     "type": "number",
-                    "description": "波形持续发送的总时长（秒），默认 5 秒，最大 120 秒",
+                    "description": "波形持续发送的总时长（秒），默认 30 秒，最小 30 秒，最大 180 秒",
                 },
             },
             "required": ["channel", "wave_name"],
@@ -204,13 +294,13 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
         wave_name = kwargs.get("wave_name", "breathe")
 
         try:
-            duration = float(kwargs.get("duration_seconds", 5))
+            duration = float(kwargs.get("duration_seconds", 30))
         except (TypeError, ValueError):
             return "错误：duration_seconds 必须是数字。"
 
-        if duration <= 0:
-            return "错误：duration_seconds 必须大于 0。"
-        duration = min(duration, 120)
+        if duration < 30:
+            return "错误：duration_seconds 最小为 30 秒。"
+        duration = min(duration, 180)
 
         session, session_err = await _get_tool_session(plugin, context)
         if not session:
@@ -392,6 +482,146 @@ class DGLabQuickFireTool(FunctionTool[AstrAgentContext]):
             )
         except Exception as e:
             return f"一键开火执行失败: {str(e)}"
+
+
+@dataclass
+class DGLabSendCustomWaveTool(FunctionTool[AstrAgentContext]):
+    """发送自定义波形到郊狼设备"""
+
+    name: str = "dglab_send_custom_wave"
+    description: str = (
+        "发送自定义波形到 DG-Lab 郊狼设备。"
+        "每条 frame 代表 100ms，必须包含 4 组频率(freqs)与 4 组强度(strengths)，每组对应 25ms。"
+        "freqs 输入范围 10-1000，会自动换算为协议频率字节(10-240)；strengths 输入范围 0-100。"
+        "frames 建议长度不超过 100，超过 100 会自动截断到 99 帧。"
+        "duration_seconds 默认 30 秒，最小 30 秒，最大 180 秒，期间会循环发送该自定义波形。"
+        f"\n随机抽取1个预设波形的前4帧参考（已转换为 frames 约定格式），可作为设计参考，但是不要直接使用，也不要再这基础上补充，而是学习其节奏与强度控制:\n{get_wave_model_reference_examples()}"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "通道，A 或 B",
+                    "enum": ["A", "B"],
+                },
+                "frames": {
+                    "type": "array",
+                    "description": "自定义波形帧数组（每帧=100ms，超过100帧会自动截断到99帧）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "freqs": {
+                                "type": "array",
+                                "description": "4组频率输入值（每组25ms），每项范围10-1000",
+                                "items": {"type": "number"},
+                                "minItems": 4,
+                                "maxItems": 4,
+                            },
+                            "strengths": {
+                                "type": "array",
+                                "description": "4组强度输入值（每组25ms），每项范围0-100",
+                                "items": {"type": "number"},
+                                "minItems": 4,
+                                "maxItems": 4,
+                            },
+                        },
+                        "required": ["freqs", "strengths"],
+                    },
+                    "minItems": 10,
+                    "maxItems": 100,
+                },
+                "duration_seconds": {
+                    "type": "number",
+                    "description": "波形持续发送总时长（秒），默认 30 秒，最小 30 秒，最大 180 秒",
+                },
+            },
+            "required": ["channel", "frames"],
+        }
+    )
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        plugin = _get_plugin_from_tool(self)
+        if not plugin:
+            return "错误：插件未初始化。"
+
+        channel = str(kwargs.get("channel", "A")).upper()
+        if channel not in ("A", "B"):
+            return "错误：channel 仅支持 A 或 B。"
+
+        frames = kwargs.get("frames", [])
+
+        try:
+            duration = float(kwargs.get("duration_seconds", 30))
+        except (TypeError, ValueError):
+            return "错误：duration_seconds 必须是数字。"
+
+        if duration < 30:
+            return "错误：duration_seconds 最小为 30 秒。"
+        duration = min(duration, 180)
+
+        wave_data, wave_err = _build_custom_wave_data(frames)
+        if wave_err:
+            return wave_err
+
+        session, session_err = await _get_tool_session(plugin, context)
+        if not session:
+            return session_err
+
+        if not session.controller or not session.controller.is_bound:
+            return "错误：设备未绑定，请先让用户扫码绑定 APP。"
+
+        if channel == "A" and "A" not in session.channel_config:
+            return f"错误：用户未启用 A 通道，当前配置为 {session.channel_config} 通道。"
+        if channel == "B" and "B" not in session.channel_config:
+            return f"错误：用户未启用 B 通道，当前配置为 {session.channel_config} 通道。"
+
+        try:
+            # 发送新波形前先停止旧任务，避免新旧指令交错。
+            await _cancel_session_wave_task(session)
+
+            ch_num = 1 if channel == "A" else 2
+            await session.controller.clear_wave_queue(ch_num)
+            await asyncio.sleep(0.15)
+
+            wave_duration_ms = len(wave_data) * 100
+            total_ms = duration * 1000
+            total_sends = max(1, int(total_ms / wave_duration_ms))
+
+            async def _send_custom_waves():
+                try:
+                    for i in range(total_sends):
+                        if not session.controller.is_bound:
+                            break
+                        await session.controller.send_wave(channel, wave_data)
+                        if i < total_sends - 1:
+                            await asyncio.sleep(wave_duration_ms / 1000 * 0.9)
+                except asyncio.CancelledError:
+                    logger.info("自定义波形发送后台任务已取消")
+                    raise
+                except Exception as ex:
+                    logger.error(f"自定义波形发送后台任务异常: {ex}")
+                finally:
+                    if getattr(session, "_wave_task", None) is asyncio.current_task():
+                        session._wave_task = None
+
+            session._wave_task = asyncio.create_task(_send_custom_waves())
+
+            part_info = ""
+            if channel == "A" and session.channel_a_part:
+                part_info = f"（部位: {session.channel_a_part}）"
+            elif channel == "B" and session.channel_b_part:
+                part_info = f"（部位: {session.channel_b_part}）"
+
+            return (
+                f"已向 {channel} 通道{part_info}发送自定义波形，"
+                f"共 {len(wave_data)} 帧（每帧100ms），持续约 {duration} 秒。"
+            )
+        except Exception as e:
+            return f"发送自定义波形失败: {str(e)}"
 
 
 @dataclass

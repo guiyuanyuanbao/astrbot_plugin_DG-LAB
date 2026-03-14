@@ -4,6 +4,8 @@
 格式: 4字节频率 + 4字节强度百分比
 """
 
+import random
+
 # 预设波形 (V3 格式 - 8字节HEX)
 WAVE_PRESETS: dict[str, list[str]] = {
     "呼吸": [
@@ -185,6 +187,41 @@ def get_wave_data(name: str) -> list[str]:
     if cn_name and cn_name in WAVE_PRESETS:
         return WAVE_PRESETS[cn_name]
     return []
+
+
+def _protocol_freq_to_input(freq_byte: int) -> int:
+    """将协议频率字节值映射回自定义 tool 的输入频率（确定性参考值）。"""
+    if freq_byte <= 100:
+        return freq_byte
+    if freq_byte <= 200:
+        return (freq_byte - 100) * 5 + 100
+    return (freq_byte - 200) * 10 + 600
+
+
+def _decode_frame_hex_to_model_format(frame_hex: str) -> dict:
+    """将 8 字节 HEX 波形解码为模型约定的 frame 格式。"""
+    if len(frame_hex) != 16:
+        raise ValueError("frame_hex 长度必须为 16 个十六进制字符")
+
+    freq_bytes = [int(frame_hex[i:i + 2], 16) for i in range(0, 8, 2)]
+    strength_bytes = [int(frame_hex[i:i + 2], 16) for i in range(8, 16, 2)]
+
+    return {
+        "freqs": [_protocol_freq_to_input(freq) for freq in freq_bytes],
+        "strengths": strength_bytes,
+    }
+
+
+def get_wave_model_reference_examples() -> str:
+    """随机返回 1 个预设波形前 4 帧的模型约定格式，供生成自定义波形参考。"""
+    candidates = list(WAVE_NAME_MAP.items())
+    if not candidates:
+        return "- 无可用波形参考"
+
+    en_name, cn_name = random.choice(candidates)
+    source_frames = WAVE_PRESETS.get(cn_name, [])[:4]
+    model_frames = [_decode_frame_hex_to_model_format(frame) for frame in source_frames]
+    return f"- {en_name} ({cn_name}): {model_frames}"
 
 
 def get_wave_descriptions() -> str:

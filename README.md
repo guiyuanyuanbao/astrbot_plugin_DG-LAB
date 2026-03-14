@@ -82,6 +82,7 @@ pip install -r requirements.txt
 
 - dglab_set_strength
 - dglab_send_wave
+- dglab_send_custom_wave
 - dglab_quick_fire
 - dglab_get_status
 - dglab_clear_wave
@@ -92,11 +93,6 @@ pip install -r requirements.txt
 - 命令 `/dglab fire` 用于设置会话内一键开火增量：
   - `/dglab fire 10`：A/B 通道都设置为 10
   - `/dglab fire A:8 B:12`：分通道设置
-- 工具 `dglab_quick_fire` 行为：
-  - 在当前强度基础上临时叠加增量
-  - `duration_seconds` 最大 30 秒
-  - 结束后自动恢复触发前强度
-- 波形工具 `dglab_send_wave` 的 `duration_seconds` 最大 120 秒
 
 ## 协议说明
 
@@ -172,4 +168,4 @@ WS 服务采用“按需启动 + 空闲关闭”：
 
 ## 版本
 
-当前版本：`v1.0.1`
+当前版本：`v1.0.2`
