@@ -5,6 +5,7 @@
 """
 
 import asyncio
+from typing import Optional
 from pydantic import Field
 from pydantic.dataclasses import dataclass
 from astrbot.api import logger
@@ -14,9 +15,6 @@ from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 
 from .dg_waves import get_wave_data, get_wave_names, get_wave_descriptions, WAVE_NAME_MAP
-
-# 模块级别的插件引用，由 create_dglab_tools 设置
-_plugin_ref = None
 
 
 async def _cancel_session_wave_task(session) -> None:
@@ -39,19 +37,20 @@ async def _cancel_session_wave_task(session) -> None:
 
 def create_dglab_tools(plugin) -> list:
     """创建 DG-Lab 相关的 LLM Tools"""
-    global _plugin_ref
-    _plugin_ref = plugin
-    return [
+    tools = [
         DGLabSetStrengthTool(),
         DGLabSendWaveTool(),
         DGLabGetStatusTool(),
         DGLabClearWaveTool(),
         DGLabStopOutputTool(),
     ]
+    for tool in tools:
+        tool._plugin = plugin
+    return tools
 
 
-def _get_plugin():
-    return _plugin_ref
+def _get_plugin_from_tool(tool) -> Optional[object]:
+    return getattr(tool, "_plugin", None)
 
 
 async def _get_tool_session(plugin, context):
@@ -100,13 +99,17 @@ class DGLabSetStrengthTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], **kwargs
     ) -> ToolExecResult:
-        plugin = _get_plugin()
+        plugin = _get_plugin_from_tool(self)
         if not plugin:
             return "错误：插件未初始化。"
 
-        channel = kwargs.get("channel", "A").upper()
+        channel = str(kwargs.get("channel", "A")).upper()
         mode = kwargs.get("mode", "set")
-        value = int(kwargs.get("value", 0))
+
+        try:
+            value = int(kwargs.get("value", 0))
+        except (TypeError, ValueError):
+            return "错误：value 必须是整数。"
 
         session, session_err = await _get_tool_session(plugin, context)
         if not session:
@@ -179,13 +182,21 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], **kwargs
     ) -> ToolExecResult:
-        plugin = _get_plugin()
+        plugin = _get_plugin_from_tool(self)
         if not plugin:
             return "错误：插件未初始化。"
 
-        channel = kwargs.get("channel", "A").upper()
+        channel = str(kwargs.get("channel", "A")).upper()
         wave_name = kwargs.get("wave_name", "breathe")
-        duration = min(float(kwargs.get("duration_seconds", 5)), 30)
+
+        try:
+            duration = float(kwargs.get("duration_seconds", 5))
+        except (TypeError, ValueError):
+            return "错误：duration_seconds 必须是数字。"
+
+        if duration <= 0:
+            return "错误：duration_seconds 必须大于 0。"
+        duration = min(duration, 30)
 
         session, session_err = await _get_tool_session(plugin, context)
         if not session:
@@ -270,7 +281,7 @@ class DGLabGetStatusTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], **kwargs
     ) -> ToolExecResult:
-        plugin = _get_plugin()
+        plugin = _get_plugin_from_tool(self)
         if not plugin:
             return "错误：插件未初始化。"
 
@@ -321,11 +332,13 @@ class DGLabClearWaveTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], **kwargs
     ) -> ToolExecResult:
-        plugin = _get_plugin()
+        plugin = _get_plugin_from_tool(self)
         if not plugin:
             return "错误：插件未初始化。"
 
-        channel = kwargs.get("channel", "A").upper()
+        channel = str(kwargs.get("channel", "A")).upper()
+        if channel not in ("A", "B"):
+            return "错误：channel 仅支持 A 或 B。"
 
         session, session_err = await _get_tool_session(plugin, context)
         if not session:
@@ -365,7 +378,7 @@ class DGLabStopOutputTool(FunctionTool[AstrAgentContext]):
     async def call(
         self, context: ContextWrapper[AstrAgentContext], **kwargs
     ) -> ToolExecResult:
-        plugin = _get_plugin()
+        plugin = _get_plugin_from_tool(self)
         if not plugin:
             return "错误：插件未初始化。"
 

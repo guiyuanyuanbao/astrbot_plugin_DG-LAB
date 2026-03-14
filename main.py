@@ -1,18 +1,16 @@
 import asyncio
-import json
 import io
 import os
 import tempfile
 from typing import Optional
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 
 from .dg_server import DGLabWSServer, DGLabController
-from .dg_waves import WAVE_PRESETS, WAVE_NAME_MAP, get_wave_data, get_wave_descriptions, get_wave_names
 
 
 class DGLabSession:
@@ -406,6 +404,8 @@ class DGLabPlugin(Star):
         session.active = True
         qr_path = None
         controller = None
+        switched_persona = False
+        curr_cid = None
 
         try:
             # 创建控制器
@@ -460,6 +460,7 @@ class DGLabPlugin(Star):
                         conversation_id=curr_cid,
                         persona_id=dglab_persona_id,
                     )
+                    switched_persona = True
 
             # 注册 LLM Tools
             self._register_tools(session)
@@ -468,6 +469,19 @@ class DGLabPlugin(Star):
 
         except Exception as e:
             logger.error(f"郊狼模式开启流程失败: {e}")
+
+            # 若已切换到郊狼人格，失败时回滚到进入前人格，避免人格残留。
+            if switched_persona and curr_cid:
+                try:
+                    conv_mgr = self.context.conversation_manager
+                    await conv_mgr.update_conversation(
+                        unified_msg_origin=umo,
+                        conversation_id=curr_cid,
+                        persona_id=session.original_persona_id,
+                    )
+                except Exception as restore_err:
+                    logger.error(f"郊狼模式失败时回滚人格失败: {restore_err}")
+
             # 回滚控制器注册，避免残留虚拟客户端
             if self._ws_server and controller and controller.client_id:
                 self._ws_server.clients.pop(controller.client_id, None)
