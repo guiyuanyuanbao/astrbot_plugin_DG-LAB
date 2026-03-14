@@ -7,8 +7,8 @@
 import asyncio
 import json
 import uuid
-import logging
 from typing import Optional, Callable, Awaitable, Union
+from astrbot.api import logger
 
 import websockets
 
@@ -16,8 +16,6 @@ try:
     from websockets.asyncio.server import ServerConnection
 except ImportError:
     from websockets.legacy.server import WebSocketServerProtocol as ServerConnection
-
-logger = logging.getLogger("astrbot")
 
 # 标记内部虚拟客户端的哨兵对象
 _VIRTUAL_CLIENT = object()

@@ -5,17 +5,15 @@
 """
 
 import asyncio
-import logging
 from pydantic import Field
 from pydantic.dataclasses import dataclass
+from astrbot.api import logger
 
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 
 from .dg_waves import get_wave_data, get_wave_names, get_wave_descriptions, WAVE_NAME_MAP
-
-logger = logging.getLogger("astrbot")
 
 # 模块级别的插件引用，由 create_dglab_tools 设置
 _plugin_ref = None

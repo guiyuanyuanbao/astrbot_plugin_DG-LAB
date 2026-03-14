@@ -3,7 +3,6 @@ import json
 import io
 import os
 import tempfile
-import logging
 from typing import Optional
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
