@@ -417,6 +417,16 @@ class DGLabPlugin(Star):
 
         # 断开控制器连接
         if session.controller:
+            if session._wave_task and not session._wave_task.done():
+                session._wave_task.cancel()
+                try:
+                    await session._wave_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"停止会话波形任务时出现异常: {e}")
+            session._wave_task = None
+
             if session.controller.is_bound:
                 try:
                     # 将强度归零
@@ -565,6 +575,16 @@ class DGLabPlugin(Star):
         """插件销毁"""
         # 关闭所有 session
         for umo, session in list(_sessions.items()):
+            if session._wave_task and not session._wave_task.done():
+                session._wave_task.cancel()
+                try:
+                    await session._wave_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"terminate 时停止波形任务异常: {e}")
+            session._wave_task = None
+
             if session.active and session.controller and session.controller.is_bound:
                 try:
                     await session.controller.send_strength(1, 2, 0)

@@ -19,6 +19,24 @@ from .dg_waves import get_wave_data, get_wave_names, get_wave_descriptions, WAVE
 _plugin_ref = None
 
 
+async def _cancel_session_wave_task(session) -> None:
+    """取消并回收会话中的后台波形任务。"""
+    wave_task = getattr(session, "_wave_task", None)
+    if not wave_task:
+        return
+
+    if not wave_task.done():
+        wave_task.cancel()
+        try:
+            await wave_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as ex:
+            logger.warning(f"取消旧波形任务时出现异常: {ex}")
+
+    session._wave_task = None
+
+
 def create_dglab_tools(plugin) -> list:
     """创建 DG-Lab 相关的 LLM Tools"""
     global _plugin_ref
@@ -179,6 +197,9 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
             return f"错误：未找到波形 '{wave_name}'。可用波形: {available}"
 
         try:
+            # 发送新波形前先停止旧任务，避免新旧指令交错。
+            await _cancel_session_wave_task(session)
+
             # 先清空队列
             ch_num = 1 if channel == "A" else 2
             await session.controller.clear_wave_queue(ch_num)
@@ -198,10 +219,16 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
                         await session.controller.send_wave(channel, wave_data)
                         if i < total_sends - 1:
                             await asyncio.sleep(wave_duration_ms / 1000 * 0.9)
+                except asyncio.CancelledError:
+                    logger.info("波形发送后台任务已取消")
+                    raise
                 except Exception as ex:
                     logger.error(f"波形发送后台任务异常: {ex}")
+                finally:
+                    if getattr(session, "_wave_task", None) is asyncio.current_task():
+                        session._wave_task = None
 
-            asyncio.create_task(_send_waves())
+            session._wave_task = asyncio.create_task(_send_waves())
 
             cn_name = WAVE_NAME_MAP.get(wave_name, wave_name)
             part_info = ""
@@ -300,6 +327,8 @@ class DGLabClearWaveTool(FunctionTool[AstrAgentContext]):
             return "错误：设备未绑定。"
 
         try:
+            # 清空前先停止后台发送，避免旧任务继续写入。
+            await _cancel_session_wave_task(session)
             ch_num = 1 if channel == "A" else 2
             await session.controller.clear_wave_queue(ch_num)
             return f"已清空 {channel} 通道的波形队列。"
@@ -341,6 +370,8 @@ class DGLabStopOutputTool(FunctionTool[AstrAgentContext]):
 
         try:
             ctrl = session.controller
+            # 先停止后台波形任务，避免 stop 后仍有发送。
+            await _cancel_session_wave_task(session)
             # 清空波形队列
             await ctrl.clear_wave_queue(1)
             await ctrl.clear_wave_queue(2)
