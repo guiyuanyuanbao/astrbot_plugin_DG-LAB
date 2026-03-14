@@ -355,16 +355,12 @@ class DGLabQuickFireTool(FunctionTool[AstrAgentContext]):
                 return f"错误：用户未启用 A 通道，当前配置为 {session.channel_config} 通道。"
             max_a = _get_channel_max_strength(plugin, session, "A")
             new_a = min(max_a, original_a + boost_a)
-            # 若触发上限封顶，则将该通道一键开火增量回写为实际可增加值。
-            session.quick_fire_boost_a = max(0, min(30, new_a - original_a))
             targets.append((1, new_a))
         if channel in ("B", "AB"):
             if "B" not in session.channel_config:
                 return f"错误：用户未启用 B 通道，当前配置为 {session.channel_config} 通道。"
             max_b = _get_channel_max_strength(plugin, session, "B")
             new_b = min(max_b, original_b + boost_b)
-            # 若触发上限封顶，则将该通道一键开火增量回写为实际可增加值。
-            session.quick_fire_boost_b = max(0, min(30, new_b - original_b))
             targets.append((2, new_b))
 
         try:
