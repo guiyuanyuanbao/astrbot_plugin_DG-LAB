@@ -18,6 +18,12 @@
     "hint": "生成二维码时使用的地址，需要填写 APP 能够访问到的 IP 地址（如局域网 IP 或公网 IP）",
     "obvious_hint": true
   },
+  "send_qr_raw_url": {
+    "description": "发送二维码时附带原始链接",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，发送二维码时会同时附带可复制的原始绑定链接。"
+  },
   "max_strength_a": {
     "description": "A 通道最大强度",
     "type": "int",

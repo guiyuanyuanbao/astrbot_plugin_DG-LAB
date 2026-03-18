@@ -44,6 +44,7 @@ pip install -r requirements.txt
 - ws_host: WebSocket 监听地址，默认 `0.0.0.0`
 - ws_port: WebSocket 监听端口，默认 `5555`
 - ws_external_host: 二维码中的可访问地址（局域网 IP 或公网域名/IP）
+- send_qr_raw_url: 发送二维码时是否附带原始绑定链接（默认开启）
 - max_strength_a: A 通道最大强度（0-200）
 - max_strength_b: B 通道最大强度（0-200）
 - dglab_persona_id: 郊狼共享人格 ID
@@ -168,4 +169,4 @@ WS 服务采用“按需启动 + 空闲关闭”：
 
 ## 版本
 
-当前版本：`v1.0.2`
+当前版本：`v1.0.3`

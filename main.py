@@ -51,7 +51,7 @@ class DGLabSession:
         return " | ".join(parts)
 
 
-@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.2")
+@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.3")
 class DGLabPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -59,6 +59,7 @@ class DGLabPlugin(Star):
         self._ws_host: str = config.get("ws_host", "0.0.0.0")
         self._ws_port: int = config.get("ws_port", 5555)
         self._ws_external_host: str = config.get("ws_external_host", "127.0.0.1")
+        self._send_qr_raw_url: bool = bool(config.get("send_qr_raw_url", True))
         self._max_strength_a: int = config.get("max_strength_a", 100)
         self._max_strength_b: int = config.get("max_strength_b", 100)
         # 郊狼人格配置
@@ -594,11 +595,23 @@ class DGLabPlugin(Star):
             return
 
         # 发送二维码
+        qr_link_text = f"\n🔗 绑定链接:\n{qr_url}" if self._send_qr_raw_url else ""
+        tips_text = (
+            "\n\n操作提示:\n"
+            "1. 打开 DG-Lab APP，使用扫码功能绑定设备。\n"
+            "2. 若扫码无反应，请检查 外部访问地址(IP) 与 WebSocket 服务端口 是否可被手机访问。\n"
+            "3. 可使用 /dglab channel A|B|AB 设置通道，/dglab part A:部位 B:部位 设置部位。\n"
+            "4. 可使用 /dglab fire 10 或 /dglab fire A:8 B:12 设置一键开火临时增量。\n"
+            "5. 使用 /dglab status 查看状态，使用 /dglab stop 退出并归零强度。\n"
+            "6. 不清楚如何操作可发送 /dglab help 查看完整指令说明。\n"
+            "7. 绑定成功后，大模型可自主控制波形与强度。"
+        )
+
         if qr_path:
             chain = [
-                Comp.Plain("🐺 郊狼模式已开启！请使用 DG-Lab APP 扫描以下二维码绑定设备：\n"),
+                Comp.Plain("🐺 郊狼模式已开启！请使用 DG-Lab APP 扫描下方二维码完成绑定。\n"),
                 Comp.Image.fromFileSystem(qr_path),
-                Comp.Plain(f"\n\n二维码内容: {qr_url}\n\n提示:\n- 使用 /dglab channel 设置通道\n- 使用 /dglab part 设置部位\n- 使用 /dglab stop 退出郊狼模式\n- 绑定成功后，大模型可以自主控制波形和强度"),
+                Comp.Plain(f"{qr_link_text}{tips_text}"),
             ]
             yield event.chain_result(chain)
             # 清理临时文件
@@ -607,9 +620,15 @@ class DGLabPlugin(Star):
             except Exception:
                 pass
         else:
+            fallback_header = (
+                "二维码图片生成失败，请检查运行环境是否已安装 qrcode 依赖后重试或复制以下链接到任意二维码生成器生成二维码扫码完成绑定："
+                if self._send_qr_raw_url
+                else "二维码图片生成失败，请检查运行环境是否已安装 qrcode 依赖后重试。"
+            )
             yield event.plain_result(
-                f"🐺 郊狼模式已开启！\n\n请使用 DG-Lab APP 扫描以下二维码绑定设备:\n{qr_url}\n\n"
-                f"提示:\n- 使用 /dglab channel 设置通道\n- 使用 /dglab part 设置部位\n- 使用 /dglab stop 退出郊狼模式"
+                "🐺 郊狼模式已开启！\n\n"
+                f"{fallback_header}"
+                f"{qr_link_text if self._send_qr_raw_url else ''}{tips_text}"
             )
 
     @dglab_group.command("stop", alias={"退出", "关闭"})
