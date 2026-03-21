@@ -106,22 +106,38 @@ def _build_custom_wave_data(frames: list[dict]) -> tuple[list[str], Optional[str
     return wave_data, None
 
 
-async def _cancel_session_wave_task(session) -> None:
-    """取消并回收会话中的后台波形任务。"""
-    wave_task = getattr(session, "_wave_task", None)
-    if not wave_task:
-        return
+def _get_wave_task_attr(channel: str) -> str:
+    """返回通道对应的后台波形任务属性名。"""
+    return "_wave_task_a" if channel == "A" else "_wave_task_b"
 
-    if not wave_task.done():
-        wave_task.cancel()
-        try:
-            await wave_task
-        except asyncio.CancelledError:
-            pass
-        except Exception as ex:
-            logger.warning(f"取消旧波形任务时出现异常: {ex}")
 
-    session._wave_task = None
+async def _cancel_session_wave_task(session, channel: Optional[str] = None) -> None:
+    """取消并回收会话中的后台波形任务。
+
+    channel 为 A/B 时仅取消对应通道任务；为空时取消全部通道任务。
+    """
+    task_attrs = []
+
+    if channel in ("A", "B"):
+        task_attrs.append(_get_wave_task_attr(channel))
+    else:
+        task_attrs.extend(["_wave_task_a", "_wave_task_b"])
+
+    for task_attr in task_attrs:
+        wave_task = getattr(session, task_attr, None)
+        if not wave_task:
+            continue
+
+        if not wave_task.done():
+            wave_task.cancel()
+            try:
+                await wave_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as ex:
+                logger.warning(f"取消旧波形任务时出现异常: {ex}")
+
+        setattr(session, task_attr, None)
 
 
 def create_dglab_tools(plugin) -> list:
@@ -258,7 +274,7 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
     description: str = (
         "向 DG-Lab 郊狼设备的指定通道发送预设波形数据。"
         f"可用波形列表:\n{get_wave_descriptions()}\n"
-        "wave_name 使用英文名。duration_seconds 控制波形持续发送的秒数（波形会循环发送,可在还有波形时发送新波形,会覆盖旧波形），取值范围 30-180 秒。"
+        "wave_name 使用英文名。波形会持续循环发送，直到调用停止输出/清空波形，或发送新的波形进行覆盖。"
         "注意：只有在郊狼模式开启且设备已绑定时才能使用。"
     )
     parameters: dict = Field(
@@ -274,10 +290,6 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
                     "type": "string",
                     "description": f"波形名称（英文），可选: {', '.join(get_wave_names())}",
                 },
-                "duration_seconds": {
-                    "type": "number",
-                    "description": "波形持续发送的总时长（秒），默认 30 秒，最小 30 秒，最大 180 秒",
-                },
             },
             "required": ["channel", "wave_name"],
         }
@@ -291,16 +303,10 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
             return "错误：插件未初始化。"
 
         channel = str(kwargs.get("channel", "A")).upper()
+        if channel not in ("A", "B"):
+            return "错误：channel 仅支持 A 或 B。"
+
         wave_name = kwargs.get("wave_name", "breathe")
-
-        try:
-            duration = float(kwargs.get("duration_seconds", 30))
-        except (TypeError, ValueError):
-            return "错误：duration_seconds 必须是数字。"
-
-        if duration < 30:
-            return "错误：duration_seconds 最小为 30 秒。"
-        duration = min(duration, 180)
 
         session, session_err = await _get_tool_session(plugin, context)
         if not session:
@@ -320,38 +326,36 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
             return f"错误：未找到波形 '{wave_name}'。可用波形: {available}"
 
         try:
-            # 发送新波形前先停止旧任务，避免新旧指令交错。
-            await _cancel_session_wave_task(session)
+            # 发送新波形前先停止同通道旧任务，避免新旧指令交错。
+            await _cancel_session_wave_task(session, channel)
 
             # 先清空队列
             ch_num = 1 if channel == "A" else 2
             await session.controller.clear_wave_queue(ch_num)
             await asyncio.sleep(0.15)
 
-            # 计算需要发送的总帧数
+            # 计算单轮波形时长
             wave_duration_ms = len(wave_data) * 100
-            total_ms = duration * 1000
-            total_sends = max(1, int(total_ms / wave_duration_ms))
+            task_attr = _get_wave_task_attr(channel)
 
-            # 在后台任务中发送波形（避免阻塞 tool call 返回）
+            # 在后台任务中持续循环发送（避免阻塞 tool call 返回）
             async def _send_waves():
                 try:
-                    for i in range(total_sends):
+                    while True:
                         if not session.controller.is_bound:
                             break
                         await session.controller.send_wave(channel, wave_data)
-                        if i < total_sends - 1:
-                            await asyncio.sleep(wave_duration_ms / 1000 * 0.9)
+                        await asyncio.sleep(wave_duration_ms / 1000 * 0.9)
                 except asyncio.CancelledError:
                     logger.info("波形发送后台任务已取消")
                     raise
                 except Exception as ex:
                     logger.error(f"波形发送后台任务异常: {ex}")
                 finally:
-                    if getattr(session, "_wave_task", None) is asyncio.current_task():
-                        session._wave_task = None
+                    if getattr(session, task_attr, None) is asyncio.current_task():
+                        setattr(session, task_attr, None)
 
-            session._wave_task = asyncio.create_task(_send_waves())
+            setattr(session, task_attr, asyncio.create_task(_send_waves()))
 
             cn_name = WAVE_NAME_MAP.get(wave_name, wave_name)
             part_info = ""
@@ -360,7 +364,7 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
             elif channel == "B" and session.channel_b_part:
                 part_info = f"（部位: {session.channel_b_part}）"
 
-            return f"已向 {channel} 通道{part_info}发送波形 '{cn_name}'，持续约 {duration} 秒。"
+            return f"已向 {channel} 通道{part_info}发送波形 '{cn_name}'，将持续循环发送，直到停止或被新波形覆盖。"
         except Exception as e:
             return f"发送波形失败: {str(e)}"
 
@@ -580,8 +584,8 @@ class DGLabSendCustomWaveTool(FunctionTool[AstrAgentContext]):
             return f"错误：用户未启用 B 通道，当前配置为 {session.channel_config} 通道。"
 
         try:
-            # 发送新波形前先停止旧任务，避免新旧指令交错。
-            await _cancel_session_wave_task(session)
+            # 发送新波形前先停止同通道旧任务，避免新旧指令交错。
+            await _cancel_session_wave_task(session, channel)
 
             ch_num = 1 if channel == "A" else 2
             await session.controller.clear_wave_queue(ch_num)
@@ -590,6 +594,7 @@ class DGLabSendCustomWaveTool(FunctionTool[AstrAgentContext]):
             wave_duration_ms = len(wave_data) * 100
             total_ms = duration * 1000
             total_sends = max(1, int(total_ms / wave_duration_ms))
+            task_attr = _get_wave_task_attr(channel)
 
             async def _send_custom_waves():
                 try:
@@ -605,10 +610,10 @@ class DGLabSendCustomWaveTool(FunctionTool[AstrAgentContext]):
                 except Exception as ex:
                     logger.error(f"自定义波形发送后台任务异常: {ex}")
                 finally:
-                    if getattr(session, "_wave_task", None) is asyncio.current_task():
-                        session._wave_task = None
+                    if getattr(session, task_attr, None) is asyncio.current_task():
+                        setattr(session, task_attr, None)
 
-            session._wave_task = asyncio.create_task(_send_custom_waves())
+            setattr(session, task_attr, asyncio.create_task(_send_custom_waves()))
 
             part_info = ""
             if channel == "A" and session.channel_a_part:
@@ -712,7 +717,7 @@ class DGLabClearWaveTool(FunctionTool[AstrAgentContext]):
 
         try:
             # 清空前先停止后台发送，避免旧任务继续写入。
-            await _cancel_session_wave_task(session)
+            await _cancel_session_wave_task(session, channel)
             ch_num = 1 if channel == "A" else 2
             await session.controller.clear_wave_queue(ch_num)
             return f"已清空 {channel} 通道的波形队列。"

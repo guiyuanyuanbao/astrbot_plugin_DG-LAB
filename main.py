@@ -27,7 +27,8 @@ class DGLabSession:
         self.original_persona_id: Optional[str] = None  # 进入郊狼模式前的人格 ID
         self.dglab_persona_id: Optional[str] = None  # 当前使用的郊狼共享人格 ID
         self.bound_conversation_id: Optional[str] = None  # 绑定郊狼模式时的对话 ID
-        self._wave_task: Optional[asyncio.Task] = None
+        self._wave_task_a: Optional[asyncio.Task] = None
+        self._wave_task_b: Optional[asyncio.Task] = None
         self.quick_fire_boost_a: int = 1  # 一键开火 A 通道临时增量
         self.quick_fire_boost_b: int = 1  # 一键开火 B 通道临时增量
         self._quick_fire_restore_task: Optional[asyncio.Task] = None
@@ -51,7 +52,7 @@ class DGLabSession:
         return " | ".join(parts)
 
 
-@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.3")
+@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.4")
 class DGLabPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -653,15 +654,17 @@ class DGLabPlugin(Star):
                     logger.warning(f"停止会话一键开火恢复任务时出现异常: {e}")
             session._quick_fire_restore_task = None
 
-            if session._wave_task and not session._wave_task.done():
-                session._wave_task.cancel()
-                try:
-                    await session._wave_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.warning(f"停止会话波形任务时出现异常: {e}")
-            session._wave_task = None
+            for task_attr in ("_wave_task_a", "_wave_task_b"):
+                wave_task = getattr(session, task_attr, None)
+                if wave_task and not wave_task.done():
+                    wave_task.cancel()
+                    try:
+                        await wave_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logger.warning(f"停止会话波形任务时出现异常: {e}")
+                setattr(session, task_attr, None)
 
             if session.controller.is_bound:
                 try:
@@ -814,15 +817,17 @@ class DGLabPlugin(Star):
                     logger.warning(f"terminate 时停止一键开火恢复任务异常: {e}")
             session._quick_fire_restore_task = None
 
-            if session._wave_task and not session._wave_task.done():
-                session._wave_task.cancel()
-                try:
-                    await session._wave_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.warning(f"terminate 时停止波形任务异常: {e}")
-            session._wave_task = None
+            for task_attr in ("_wave_task_a", "_wave_task_b"):
+                wave_task = getattr(session, task_attr, None)
+                if wave_task and not wave_task.done():
+                    wave_task.cancel()
+                    try:
+                        await wave_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logger.warning(f"terminate 时停止波形任务异常: {e}")
+                setattr(session, task_attr, None)
 
             if session.active and session.controller and session.controller.is_bound:
                 try:
