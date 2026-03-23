@@ -32,6 +32,7 @@ class DGLabSession:
         self.quick_fire_boost_a: int = 1  # 一键开火 A 通道临时增量
         self.quick_fire_boost_b: int = 1  # 一键开火 B 通道临时增量
         self._quick_fire_restore_task: Optional[asyncio.Task] = None
+        self._is_exiting: bool = False
 
     def get_status_desc(self) -> str:
         """获取当前会话状态描述"""
@@ -52,7 +53,7 @@ class DGLabSession:
         return " | ".join(parts)
 
 
-@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.8")
+@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.9")
 class DGLabPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -82,6 +83,7 @@ class DGLabPlugin(Star):
         self._shared_dglab_persona_id: Optional[str] = None
         self._sessions: dict[str, DGLabSession] = {}
         self._sessions_lock = asyncio.Lock()
+        self._idle_cleanup_task: Optional[asyncio.Task] = None
 
     async def initialize(self):
         """插件初始化（WS 服务按郊狼模式启停）"""
@@ -199,6 +201,25 @@ class DGLabPlugin(Star):
                 self._server_started = False
                 self._ws_server = None
 
+    async def _cleanup_idle_resources(self):
+        """在无活跃会话时回收工具、WS 服务与共享人格。"""
+        if await self._has_active_sessions():
+            return
+        self._unregister_tools()
+        await self._stop_server_if_idle()
+        await self._delete_shared_dglab_persona_if_idle()
+
+    async def _cleanup_idle_resources_deferred(self):
+        """延后执行空闲资源回收，避免在 WS 断连回调栈中停服导致等待环。"""
+        await asyncio.sleep(0)
+        await self._cleanup_idle_resources()
+
+    def _schedule_idle_cleanup(self):
+        """调度一次空闲资源回收任务（去重）。"""
+        if self._idle_cleanup_task and not self._idle_cleanup_task.done():
+            return
+        self._idle_cleanup_task = asyncio.create_task(self._cleanup_idle_resources_deferred())
+
     async def _on_strength_update(self, client_id: str, target_id: str, message: str):
         """APP 上报强度数据的回调"""
         for session in await self._get_sessions_snapshot():
@@ -228,14 +249,106 @@ class DGLabPlugin(Star):
             if session.controller and session.active:
                 ctrl = session.controller
                 if ctrl.client_id == disconnected_id or ctrl.target_id == disconnected_id:
-                    session.controller._bound = False
-                    session.controller.target_id = None
-                    try:
-                        chain = MessageChain().message("⚠️ DG-Lab APP 已断开连接。")
-                        await self.context.send_message(session.umo, chain)
-                    except Exception as e:
-                        logger.error(f"发送断开通知失败: {e}")
+                    # 客户端主动断连时，执行与 /dglab stop 一致的完整退出流程。
+                    await self._exit_session(
+                        session,
+                        reason="ws_disconnect",
+                        proactive_notice=True,
+                        notice_text="⚠️ DG-Lab APP 已断开连接，已自动退出郊狼模式。",
+                    )
                     break
+
+    async def _cancel_session_tasks(self, session: DGLabSession):
+        """取消会话后台任务（波形任务 + 一键开火恢复任务）。"""
+        if session._quick_fire_restore_task and not session._quick_fire_restore_task.done():
+            session._quick_fire_restore_task.cancel()
+            try:
+                await session._quick_fire_restore_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"停止会话一键开火恢复任务时出现异常: {e}")
+        session._quick_fire_restore_task = None
+
+        for task_attr in ("_wave_task_a", "_wave_task_b"):
+            wave_task = getattr(session, task_attr, None)
+            if wave_task and not wave_task.done():
+                wave_task.cancel()
+                try:
+                    await wave_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"停止会话波形任务时出现异常: {e}")
+            setattr(session, task_attr, None)
+
+    async def _exit_session(
+        self,
+        session: DGLabSession,
+        reason: str = "manual",
+        proactive_notice: bool = False,
+        notice_text: Optional[str] = None,
+    ):
+        """统一会话退出流程，供 ws 断连、/dglab stop 与 terminate 复用。"""
+        if not session or not session.active:
+            return
+        if session._is_exiting:
+            return
+
+        session._is_exiting = True
+        try:
+            await self._cancel_session_tasks(session)
+
+            if session.controller:
+                if session.controller.is_bound:
+                    try:
+                        # 将强度归零
+                        await session.controller.send_strength(1, 2, 0)
+                        await session.controller.send_strength(2, 2, 0)
+                    except Exception:
+                        pass
+
+                # ws_disconnect 场景由服务端先触发断连回调，避免再次主动断连导致重复流程。
+                if reason != "ws_disconnect" and self._ws_server and session.controller.client_id:
+                    await self._ws_server.disconnect_client(session.controller.client_id)
+
+                session.controller._bound = False
+                session.controller.target_id = None
+
+            # 恢复原人格（即使原人格为默认人格 None 也要支持）
+            try:
+                conv_mgr = self.context.conversation_manager
+                curr_cid = await conv_mgr.get_curr_conversation_id(session.umo)
+                if curr_cid:
+                    restore_persona_id = await self._resolve_restore_persona_id(session)
+                    await conv_mgr.update_conversation(
+                        unified_msg_origin=session.umo,
+                        conversation_id=curr_cid,
+                        persona_id=restore_persona_id,
+                    )
+            except Exception as e:
+                logger.error(f"恢复人格失败: {e}")
+
+            session.active = False
+            await self._pop_session(session.umo)
+
+            # 仅当没有活跃会话时回收资源。
+            # ws_disconnect 回调位于 WS handler 的断连调用链中，若同步停服会产生等待环。
+            if reason == "ws_disconnect":
+                self._schedule_idle_cleanup()
+            else:
+                await self._cleanup_idle_resources()
+
+            if proactive_notice:
+                try:
+                    chain = MessageChain().message(
+                        notice_text or "⚠️ DG-Lab APP 已断开连接，已自动退出郊狼模式。"
+                    )
+                    await self.context.send_message(session.umo, chain)
+                except Exception as e:
+                    logger.error(f"发送主动断开退出通知失败: {e}")
+        finally:
+            session._is_exiting = False
 
     async def _get_current_conversation(self, umo: str):
         """获取当前会话对话对象"""
@@ -642,63 +755,7 @@ class DGLabPlugin(Star):
             yield event.plain_result("当前未开启郊狼模式。")
             return
 
-        # 断开控制器连接
-        if session.controller:
-            if session._quick_fire_restore_task and not session._quick_fire_restore_task.done():
-                session._quick_fire_restore_task.cancel()
-                try:
-                    await session._quick_fire_restore_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.warning(f"停止会话一键开火恢复任务时出现异常: {e}")
-            session._quick_fire_restore_task = None
-
-            for task_attr in ("_wave_task_a", "_wave_task_b"):
-                wave_task = getattr(session, task_attr, None)
-                if wave_task and not wave_task.done():
-                    wave_task.cancel()
-                    try:
-                        await wave_task
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as e:
-                        logger.warning(f"停止会话波形任务时出现异常: {e}")
-                setattr(session, task_attr, None)
-
-            if session.controller.is_bound:
-                try:
-                    # 将强度归零
-                    await session.controller.send_strength(1, 2, 0)
-                    await session.controller.send_strength(2, 2, 0)
-                except Exception:
-                    pass
-            # 通过 WS 服务的标准断连流程清理会话与对端连接。
-            if self._ws_server and session.controller.client_id:
-                await self._ws_server.disconnect_client(session.controller.client_id)
-
-        # 恢复原人格（即使原人格为默认人格 None 也要支持）
-        try:
-            conv_mgr = self.context.conversation_manager
-            curr_cid = await conv_mgr.get_curr_conversation_id(umo)
-            if curr_cid:
-                restore_persona_id = await self._resolve_restore_persona_id(session)
-                await conv_mgr.update_conversation(
-                    unified_msg_origin=umo,
-                    conversation_id=curr_cid,
-                    persona_id=restore_persona_id,
-                )
-        except Exception as e:
-            logger.error(f"恢复人格失败: {e}")
-
-        session.active = False
-        await self._pop_session(umo)
-
-        # 仅当没有活跃会话时卸载工具、停服并删除共享人格
-        if not await self._has_active_sessions():
-            self._unregister_tools()
-            await self._stop_server_if_idle()
-            await self._delete_shared_dglab_persona_if_idle()
+        await self._exit_session(session, reason="manual", proactive_notice=False)
 
         yield event.plain_result("🐺 郊狼模式已关闭，设备强度已归零。")
 
@@ -806,37 +863,18 @@ class DGLabPlugin(Star):
         """插件销毁"""
         # 关闭所有 session
         for session in await self._get_sessions_snapshot():
-            if session._quick_fire_restore_task and not session._quick_fire_restore_task.done():
-                session._quick_fire_restore_task.cancel()
-                try:
-                    await session._quick_fire_restore_task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.warning(f"terminate 时停止一键开火恢复任务异常: {e}")
-            session._quick_fire_restore_task = None
-
-            for task_attr in ("_wave_task_a", "_wave_task_b"):
-                wave_task = getattr(session, task_attr, None)
-                if wave_task and not wave_task.done():
-                    wave_task.cancel()
-                    try:
-                        await wave_task
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as e:
-                        logger.warning(f"terminate 时停止波形任务异常: {e}")
-                setattr(session, task_attr, None)
-
-            if session.active and session.controller and session.controller.is_bound:
-                try:
-                    await session.controller.send_strength(1, 2, 0)
-                    await session.controller.send_strength(2, 2, 0)
-                except Exception:
-                    pass
-            if self._ws_server and session.controller and session.controller.client_id:
-                await self._ws_server.disconnect_client(session.controller.client_id)
-            session.active = False
+            is_bound = bool(session.controller and session.controller.is_bound)
+            notice_text = (
+                "⚠️ 插件正在卸载，已自动退出郊狼模式并断开设备连接。"
+                if is_bound
+                else None
+            )
+            await self._exit_session(
+                session,
+                reason="terminate",
+                proactive_notice=is_bound,
+                notice_text=notice_text,
+            )
         async with self._sessions_lock:
             self._sessions.clear()
 
