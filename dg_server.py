@@ -295,6 +295,19 @@ class DGLabWSServer:
                 except Exception:
                     pass
 
+    async def disconnect_client(self, client_id: Optional[str]):
+        """按服务端正常断连流程断开指定 client。"""
+        if not client_id:
+            return
+
+        if client_id in self.clients:
+            await self._handle_disconnect(client_id)
+            return
+
+        owner_client_id = self.get_client_id_for_target(client_id)
+        if owner_client_id:
+            await self._handle_disconnect(owner_client_id)
+
 
 class DGLabController:
     """DG-Lab 控制器

@@ -52,7 +52,7 @@ class DGLabSession:
         return " | ".join(parts)
 
 
-@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.7")
+@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.8")
 class DGLabPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -673,10 +673,9 @@ class DGLabPlugin(Star):
                     await session.controller.send_strength(2, 2, 0)
                 except Exception:
                     pass
-            # 无论是否绑定都移除虚拟客户端和关系，避免泄漏
+            # 通过 WS 服务的标准断连流程清理会话与对端连接。
             if self._ws_server and session.controller.client_id:
-                self._ws_server.clients.pop(session.controller.client_id, None)
-                self._ws_server.relations.pop(session.controller.client_id, None)
+                await self._ws_server.disconnect_client(session.controller.client_id)
 
         # 恢复原人格（即使原人格为默认人格 None 也要支持）
         try:
@@ -835,6 +834,8 @@ class DGLabPlugin(Star):
                     await session.controller.send_strength(2, 2, 0)
                 except Exception:
                     pass
+            if self._ws_server and session.controller and session.controller.client_id:
+                await self._ws_server.disconnect_client(session.controller.client_id)
             session.active = False
         async with self._sessions_lock:
             self._sessions.clear()
