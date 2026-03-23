@@ -1,6 +1,6 @@
 name: astrbot_plugin_DG-LAB
 display_name: AstrBot郊狼控制器
 desc: 让大模型控制你的郊狼吧 ,通过与 AstrBot 聊天控制 DG-LAB 郊狼脉冲主机。
-version: v1.0.5
+version: v1.0.6
 author: 桂鸢
 repo: https://github.com/guiyuanyuanbao/astrbot_plugin_DG-LAB

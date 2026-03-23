@@ -52,7 +52,7 @@ class DGLabSession:
         return " | ".join(parts)
 
 
-@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.5")
+@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.6")
 class DGLabPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
