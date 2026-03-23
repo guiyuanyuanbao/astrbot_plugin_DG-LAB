@@ -50,6 +50,10 @@ class DGLabWSServer:
         self.on_bindback: Optional[Callable[[str, str], Awaitable[None]]] = None
         # 回调: 当连接断开时通知插件
         self.on_disconnect: Optional[Callable[[str], Awaitable[None]]] = None
+        # 正在执行断连流程的 clientId，避免并发重入。
+        self._disconnecting_ids: set[str] = set()
+        # 由对端主动关闭触发的二次断连回调需要跳过。
+        self._skip_disconnect_callback_ids: set[str] = set()
 
     async def start(self):
         self._server = await websockets.serve(
@@ -248,6 +252,14 @@ class DGLabWSServer:
         return target_id
 
     async def _handle_disconnect(self, disconnected_id: str):
+        # 主断连流程关闭对端 ws 后，对端 handler finally 也会进来一次；该次只做跳过。
+        if disconnected_id in self._skip_disconnect_callback_ids:
+            self._skip_disconnect_callback_ids.discard(disconnected_id)
+            return
+
+        if disconnected_id in self._disconnecting_ids:
+            return
+
         has_client = disconnected_id in self.clients
         has_relation = any(
             cid == disconnected_id or tid == disconnected_id
@@ -258,35 +270,42 @@ class DGLabWSServer:
         if not has_client and not has_relation:
             return
 
-        logger.info(f"DG-Lab WS: 断开连接 {disconnected_id}")
+        self._disconnecting_ids.add(disconnected_id)
 
-        # 通知对方
-        to_remove = []
-        for cid, tid in list(self.relations.items()):
-            if cid == disconnected_id or tid == disconnected_id:
-                other_id = tid if cid == disconnected_id else cid
-                other_ws = self.clients.get(other_id)
-                if other_ws and other_ws is not _VIRTUAL_CLIENT:
-                    try:
-                        await other_ws.send(json.dumps({
-                            "type": "break",
-                            "clientId": cid,
-                            "targetId": tid,
-                            "message": "209"
-                        }))
-                        await other_ws.close()
-                    except Exception:
-                        pass
-                self.clients.pop(other_id, None)
-                to_remove.append(cid)
+        try:
+            logger.info(f"DG-Lab WS: 断开连接 {disconnected_id}")
 
-        for cid in to_remove:
-            self.relations.pop(cid, None)
+            # 通知对方
+            to_remove = []
+            for cid, tid in list(self.relations.items()):
+                if cid == disconnected_id or tid == disconnected_id:
+                    other_id = tid if cid == disconnected_id else cid
+                    other_ws = self.clients.get(other_id)
+                    if other_ws and other_ws is not _VIRTUAL_CLIENT:
+                        try:
+                            # 对端 ws 将被关闭，其 finally 会触发一次 _handle_disconnect；该次跳过回调。
+                            self._skip_disconnect_callback_ids.add(other_id)
+                            await other_ws.send(json.dumps({
+                                "type": "break",
+                                "clientId": cid,
+                                "targetId": tid,
+                                "message": "209"
+                            }))
+                            await other_ws.close()
+                        except Exception:
+                            pass
+                    self.clients.pop(other_id, None)
+                    to_remove.append(cid)
 
-        self.clients.pop(disconnected_id, None)
+            for cid in to_remove:
+                self.relations.pop(cid, None)
 
-        if self.on_disconnect:
-            await self.on_disconnect(disconnected_id)
+            self.clients.pop(disconnected_id, None)
+
+            if self.on_disconnect:
+                await self.on_disconnect(disconnected_id)
+        finally:
+            self._disconnecting_ids.discard(disconnected_id)
 
     async def _heartbeat_loop(self):
         while True:
