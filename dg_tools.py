@@ -498,7 +498,7 @@ class DGLabSendCustomWaveTool(FunctionTool[AstrAgentContext]):
         "每条 frame 代表 100ms，必须包含 4 组频率(freqs)与 4 组强度(strengths)，每组对应 25ms。"
         "freqs 输入范围 10-1000，会自动换算为协议频率字节(10-240)；strengths 输入范围 0-100。"
         "frames 建议长度不超过 100，超过 100 会自动截断到 99 帧。"
-        "duration_seconds 默认 30 秒，最小 30 秒，最大 180 秒，期间会循环发送该自定义波形。"
+        "波形会持续循环发送，直到调用停止输出/清空波形，或发送新的波形进行覆盖。"
         f"\n随机抽取1个预设波形的前4帧参考（已转换为 frames 约定格式），可作为设计参考，但是不要直接使用，也不要再这基础上补充，而是学习其节奏与强度控制:\n{get_wave_model_reference_examples()}"
     )
     parameters: dict = Field(
@@ -536,10 +536,6 @@ class DGLabSendCustomWaveTool(FunctionTool[AstrAgentContext]):
                     "minItems": 10,
                     "maxItems": 100,
                 },
-                "duration_seconds": {
-                    "type": "number",
-                    "description": "波形持续发送总时长（秒），默认 30 秒，最小 30 秒，最大 180 秒",
-                },
             },
             "required": ["channel", "frames"],
         }
@@ -557,15 +553,6 @@ class DGLabSendCustomWaveTool(FunctionTool[AstrAgentContext]):
             return "错误：channel 仅支持 A 或 B。"
 
         frames = kwargs.get("frames", [])
-
-        try:
-            duration = float(kwargs.get("duration_seconds", 30))
-        except (TypeError, ValueError):
-            return "错误：duration_seconds 必须是数字。"
-
-        if duration < 30:
-            return "错误：duration_seconds 最小为 30 秒。"
-        duration = min(duration, 180)
 
         wave_data, wave_err = _build_custom_wave_data(frames)
         if wave_err:
@@ -592,18 +579,15 @@ class DGLabSendCustomWaveTool(FunctionTool[AstrAgentContext]):
             await asyncio.sleep(0.15)
 
             wave_duration_ms = len(wave_data) * 100
-            total_ms = duration * 1000
-            total_sends = max(1, int(total_ms / wave_duration_ms))
             task_attr = _get_wave_task_attr(channel)
 
             async def _send_custom_waves():
                 try:
-                    for i in range(total_sends):
+                    while True:
                         if not session.controller.is_bound:
                             break
                         await session.controller.send_wave(channel, wave_data)
-                        if i < total_sends - 1:
-                            await asyncio.sleep(wave_duration_ms / 1000 * 0.9)
+                        await asyncio.sleep(wave_duration_ms / 1000 * 0.9)
                 except asyncio.CancelledError:
                     logger.info("自定义波形发送后台任务已取消")
                     raise
@@ -623,7 +607,7 @@ class DGLabSendCustomWaveTool(FunctionTool[AstrAgentContext]):
 
             return (
                 f"已向 {channel} 通道{part_info}发送自定义波形，"
-                f"共 {len(wave_data)} 帧（每帧100ms），持续约 {duration} 秒。"
+                f"共 {len(wave_data)} 帧（每帧100ms），将持续循环发送，直到停止或被新波形覆盖。"
             )
         except Exception as e:
             return f"发送自定义波形失败: {str(e)}"

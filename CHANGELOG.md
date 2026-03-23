@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.5 - 2026-03-23
+
+### Changed
+- `dglab_send_custom_wave` 移除 `duration_seconds` 参数，改为持续循环发送，直到停止输出、清空队列或同通道新波形覆盖。
+
 ## v1.0.4 - 2026-03-21
 
 ### Fixed
