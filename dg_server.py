@@ -248,6 +248,16 @@ class DGLabWSServer:
         return target_id
 
     async def _handle_disconnect(self, disconnected_id: str):
+        has_client = disconnected_id in self.clients
+        has_relation = any(
+            cid == disconnected_id or tid == disconnected_id
+            for cid, tid in self.relations.items()
+        )
+
+        # 已经被清理过时直接返回，避免重复触发 on_disconnect。
+        if not has_client and not has_relation:
+            return
+
         logger.info(f"DG-Lab WS: 断开连接 {disconnected_id}")
 
         # 通知对方
