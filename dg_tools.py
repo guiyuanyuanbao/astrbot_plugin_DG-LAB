@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import random
 from typing import Optional
 from pydantic import Field
 from pydantic.dataclasses import dataclass
@@ -145,6 +146,7 @@ def create_dglab_tools(plugin) -> list:
     tools = [
         DGLabSetStrengthTool(),
         DGLabSendWaveTool(),
+        DGLabTimedSwitchWaveTool(),
         DGLabSendWaveComboTool(),
         DGLabSendCustomWaveTool(),
         DGLabQuickFireTool(),
@@ -368,6 +370,164 @@ class DGLabSendWaveTool(FunctionTool[AstrAgentContext]):
             return f"已向 {channel} 通道{part_info}发送波形 '{cn_name}'，将持续循环发送，直到停止或被新波形覆盖。"
         except Exception as e:
             return f"发送波形失败: {str(e)}"
+
+
+@dataclass
+class DGLabTimedSwitchWaveTool(FunctionTool[AstrAgentContext]):
+    """定时在多个预设波形之间切换发送"""
+
+    name: str = "dglab_timed_switch_wave"
+    description: str = (
+        "定时切换预设波形发送。"
+        f"可用波形列表:\n{get_wave_descriptions()}\n"
+        "可选顺序循环(sequence)或随机切换(random)模式。"
+        "每个切换周期内，当前波形会持续循环发送。"
+        "工具会持续运行，直到调用停止输出/清空波形，或发送新的波形进行覆盖。"
+        "注意：只有在郊狼模式开启且设备已绑定时才能使用。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "通道，A 或 B",
+                    "enum": ["A", "B"],
+                },
+                "wave_names": {
+                    "type": "array",
+                    "description": f"波形池（英文名），可选: {', '.join(get_wave_names())}",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+                "switch_interval_seconds": {
+                    "type": "number",
+                    "description": "换波形时间间隔（秒），默认 15 秒，范围 1-600 秒",
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "换波形模式：sequence=顺序循环，random=随机切换",
+                    "enum": ["sequence", "random"],
+                },
+            },
+            "required": ["channel", "wave_names"],
+        }
+    )
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        plugin = _get_plugin_from_tool(self)
+        if not plugin:
+            return "错误：插件未初始化。"
+
+        channel = str(kwargs.get("channel", "A")).upper()
+        if channel not in ("A", "B"):
+            return "错误：channel 仅支持 A 或 B。"
+
+        raw_wave_names = kwargs.get("wave_names", [])
+        if not isinstance(raw_wave_names, list) or not raw_wave_names:
+            return "错误：wave_names 必须是非空数组。"
+
+        mode = str(kwargs.get("mode", "sequence")).lower()
+        if mode not in ("sequence", "random"):
+            return "错误：mode 仅支持 sequence 或 random。"
+
+        try:
+            switch_interval_seconds = float(kwargs.get("switch_interval_seconds", 15))
+        except (TypeError, ValueError):
+            return "错误：switch_interval_seconds 必须是数字。"
+        if switch_interval_seconds < 1 or switch_interval_seconds > 600:
+            return "错误：switch_interval_seconds 必须在 1-600 秒范围内。"
+
+        session, session_err = await _get_tool_session(plugin, context)
+        if not session:
+            return session_err
+
+        if not session.controller or not session.controller.is_bound:
+            return "错误：设备未绑定，请先让用户扫码绑定 APP。"
+
+        if channel == "A" and "A" not in session.channel_config:
+            return f"错误：用户未启用 A 通道，当前配置为 {session.channel_config} 通道。"
+        if channel == "B" and "B" not in session.channel_config:
+            return f"错误：用户未启用 B 通道，当前配置为 {session.channel_config} 通道。"
+
+        wave_pool: list[tuple[str, list[str]]] = []
+        for index, name in enumerate(raw_wave_names, start=1):
+            if not isinstance(name, str) or not name.strip():
+                return f"错误：wave_names[{index}] 必须是非空字符串。"
+            wave_name = name.strip()
+            wave_data = get_wave_data(wave_name)
+            if not wave_data:
+                available = ", ".join(get_wave_names())
+                return f"错误：wave_names[{index}] 未找到波形 '{wave_name}'。可用波形: {available}"
+            wave_pool.append((wave_name, wave_data))
+
+        try:
+            # 发送新波形前先停止同通道旧任务，避免新旧指令交错。
+            await _cancel_session_wave_task(session, channel)
+
+            ch_num = 1 if channel == "A" else 2
+            await session.controller.clear_wave_queue(ch_num)
+            await asyncio.sleep(0.15)
+
+            task_attr = _get_wave_task_attr(channel)
+
+            async def _send_timed_switch_waves():
+                loop = asyncio.get_running_loop()
+                seq_index = 0
+                last_random_index = -1
+                try:
+                    while True:
+                        if not session.controller.is_bound:
+                            break
+
+                        if mode == "sequence":
+                            current_index = seq_index % len(wave_pool)
+                            seq_index += 1
+                        else:
+                            current_index = random.randrange(len(wave_pool))
+                            if len(wave_pool) > 1 and current_index == last_random_index:
+                                current_index = (current_index + 1) % len(wave_pool)
+                            last_random_index = current_index
+
+                        _, wave_data = wave_pool[current_index]
+                        end_at = loop.time() + switch_interval_seconds
+
+                        while loop.time() < end_at:
+                            if not session.controller.is_bound:
+                                return
+                            await session.controller.send_wave(channel, wave_data)
+                            wave_duration_s = max(0.1, len(wave_data) * 0.1 * 0.9)
+                            remain_s = max(0.0, end_at - loop.time())
+                            sleep_s = min(wave_duration_s, remain_s)
+                            if sleep_s > 0:
+                                await asyncio.sleep(sleep_s)
+                except asyncio.CancelledError:
+                    logger.info("定时换波形后台任务已取消")
+                    raise
+                except Exception as ex:
+                    logger.error(f"定时换波形后台任务异常: {ex}")
+                finally:
+                    if getattr(session, task_attr, None) is asyncio.current_task():
+                        setattr(session, task_attr, None)
+
+            setattr(session, task_attr, asyncio.create_task(_send_timed_switch_waves()))
+
+            part_info = ""
+            if channel == "A" and session.channel_a_part:
+                part_info = f"（部位: {session.channel_a_part}）"
+            elif channel == "B" and session.channel_b_part:
+                part_info = f"（部位: {session.channel_b_part}）"
+
+            mode_text = "顺序循环" if mode == "sequence" else "随机切换"
+            wave_text = " -> ".join(WAVE_NAME_MAP.get(name, name) for name, _ in wave_pool)
+            return (
+                f"已向 {channel} 通道{part_info}启动定时换波形（{mode_text}）：{wave_text}。"
+                f"切换间隔 {switch_interval_seconds:g} 秒，波形会持续循环发送，直到停止或被新波形覆盖。"
+            )
+        except Exception as e:
+            return f"定时换波形失败: {str(e)}"
 
 
 @dataclass

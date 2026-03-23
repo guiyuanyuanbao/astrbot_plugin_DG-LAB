@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.7 - 2026-03-23
+
+### Added
+- 新增 LLM 工具 `dglab_timed_switch_wave`：支持定时换波形，可在波形池中按 `sequence` 顺序循环或 `random` 随机切换。
+
+### Changed
+- 定时换波形工具在运行期间会持续循环发送，直到停止输出、清空队列或同通道新波形覆盖。
+
 ## v1.0.6 - 2026-03-23
 
 ### Added
