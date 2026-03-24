@@ -4,6 +4,11 @@
   <img src="logo.png" alt="DG-LAB Logo">
 </p>
 
+<p align="center">
+  <img src="Generate  产生
+https://count.getloli.com/@astrbot_plugin_DG_LAB?name=astrbot_plugin_DG_LAB&theme=booru-lewd&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto" alt="DG-LAB Counter">
+</p>
+
 > 大模型能实时解读你的对话，智能调整郊狼设备的强度和波形，让每一次互动都充满惊喜与节奏。**astrbot_plugin_DG-LAB** 将大模型与 DG-LAB 郊狼主机的控制完美融合，开启前所未有的沉浸式体验！
 
 ### ✨ 核心亮点
