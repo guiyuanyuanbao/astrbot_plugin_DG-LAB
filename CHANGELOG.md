@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.1.0 - 2026-03-29
+
+### Added
+- 新增指令 `/dglab wavelist`：查看当前可用波形列表（内置 + 用户上传）。
+- 新增指令 `/dglab waveinfo <波形名>`：查看指定波形的帧数、总时长、首帧与末帧。
+- 新增配置项 `uploaded_wave_files`（仅 `.pulse`）：支持在配置界面上传并加载 DG-Lab App 导出的波形文件。
+- 上传文件读取路径统一为 AstrBot 默认目录：`plugin_data/astrbot_plugin_DG_LAB/files/uploaded_wave_files/`。
+
 ## v1.0.9 - 2026-03-23
 
 ### Changed

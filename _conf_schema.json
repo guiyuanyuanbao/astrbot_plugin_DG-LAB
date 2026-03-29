@@ -66,5 +66,12 @@
     "default": "",
     "hint": "当进入前原人格为空时，退出郊狼后恢复到该人格 ID。留空则恢复为系统默认。",
     "_special": "select_persona"
+  },
+  "uploaded_wave_files": {
+    "description": "上传 .pulse 波形文件",
+    "type": "file",
+    "default": [],
+    "file_types": ["pulse"],
+    "hint": "支持上传多个 DG-Lab App 导出的 .pulse 波形文件，插件重载后会自动加载并与内置波形合并。"
   }
 }

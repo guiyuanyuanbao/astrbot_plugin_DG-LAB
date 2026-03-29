@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import tempfile
+from pathlib import Path
 from typing import Optional
 
 from astrbot.api.event import filter, AstrMessageEvent
@@ -9,8 +10,10 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .dg_server import DGLabWSServer, DGLabController
+from .dg_waves import get_wave_descriptions, get_wave_names, get_wave_data, reload_uploaded_waves
 
 
 class DGLabSession:
@@ -53,26 +56,30 @@ class DGLabSession:
         return " | ".join(parts)
 
 
-@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.0.9")
+@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.1.0")
 class DGLabPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        self.config = config
-        self._ws_host: str = config.get("ws_host", "0.0.0.0")
-        self._ws_port: int = config.get("ws_port", 5555)
-        self._ws_external_host: str = config.get("ws_external_host", "127.0.0.1")
-        self._send_qr_raw_url: bool = bool(config.get("send_qr_raw_url", True))
-        self._max_strength_a: int = config.get("max_strength_a", 100)
-        self._max_strength_b: int = config.get("max_strength_b", 100)
+        self.config = config or {}
+        self._ws_host: str = self.config.get("ws_host", "0.0.0.0")
+        self._ws_port: int = self.config.get("ws_port", 5555)
+        self._ws_external_host: str = self.config.get("ws_external_host", "127.0.0.1")
+        self._send_qr_raw_url: bool = bool(self.config.get("send_qr_raw_url", True))
+        self._max_strength_a: int = self.config.get("max_strength_a", 100)
+        self._max_strength_b: int = self.config.get("max_strength_b", 100)
         # 郊狼人格配置
-        self._dglab_persona_id: str = config.get("dglab_persona_id", "dglab_persona_shared")
-        self._dglab_persona_system_prompt: str = config.get("dglab_persona_system_prompt", "")
-        self._dglab_persona_begin_dialogs = config.get("dglab_persona_begin_dialogs", [])
-        self._dglab_persona_error_reply: str = config.get(
+        self._dglab_persona_id: str = self.config.get("dglab_persona_id", "dglab_persona_shared")
+        self._dglab_persona_system_prompt: str = self.config.get("dglab_persona_system_prompt", "")
+        self._dglab_persona_begin_dialogs = self.config.get("dglab_persona_begin_dialogs", [])
+        self._dglab_persona_error_reply: str = self.config.get(
             "dglab_persona_error_reply",
             "郊狼模式开启失败：无法创建并切换郊狼人格，请检查人格配置。",
         )
-        self._dglab_default_persona_id: str = config.get("dglab_default_persona_id", "")
+        self._dglab_default_persona_id: str = self.config.get("dglab_default_persona_id", "")
+        data_root = Path(get_astrbot_data_path())
+        self._plugin_data_path: Path = data_root / "plugin_data" / "astrbot_plugin_DG_LAB"
+        self._uploaded_wave_files_dir: Path = self._plugin_data_path / "files" / "uploaded_wave_files"
+        self._uploaded_wave_count: int = 0
         # 全局 WS 服务实例
         self._ws_server: Optional[DGLabWSServer] = None
         self._server_started = False
@@ -87,7 +94,12 @@ class DGLabPlugin(Star):
 
     async def initialize(self):
         """插件初始化（WS 服务按郊狼模式启停）"""
-        return
+        logger.info(f"用户上传波形目录: {self._uploaded_wave_files_dir}")
+        self._uploaded_wave_count = reload_uploaded_waves(
+            config=self.config,
+            uploaded_wave_files_dir=self._uploaded_wave_files_dir,
+            logger=logger,
+        )
 
     async def _has_active_sessions(self) -> bool:
         async with self._sessions_lock:
@@ -458,6 +470,8 @@ class DGLabPlugin(Star):
             "/dglab start - 开启郊狼模式并生成绑定二维码\n"
             "/dglab stop - 退出郊狼模式\n"
             "/dglab status - 查看当前郊狼状态\n"
+            "/dglab wavelist - 查看当前可用波形列表\n"
+            "/dglab waveinfo 波形名 - 查看指定波形详细信息\n"
             "/dglab channel A|B|AB - 设置使用通道\n"
             "/dglab part A:部位 B:部位 - 设置通道部位\n"
             "/dglab fire [强度] 或 /dglab fire A:强度 B:强度 - 设置一键开火临时增量(默认1, 最大30)\n"
@@ -465,6 +479,46 @@ class DGLabPlugin(Star):
             "/dglab help - 查看本帮助"
         )
         yield event.plain_result(help_text)
+
+    @dglab_group.command("wavelist", alias={"波形列表"})
+    async def dglab_wavelist(self, event: AstrMessageEvent):
+        """查看当前可用波形（内置 + 用户上传）。"""
+        wave_names = get_wave_names()
+        if not wave_names:
+            yield event.plain_result("当前没有可用波形。")
+            return
+
+        msg = (
+            f"当前可用波形共 {len(wave_names)} 个（其中用户上传 {self._uploaded_wave_count} 个）：\n"
+            f"{get_wave_descriptions()}"
+        )
+        yield event.plain_result(msg)
+
+    @dglab_group.command("waveinfo", alias={"波形信息"})
+    async def dglab_waveinfo(self, event: AstrMessageEvent, wave_name: str = ""):
+        """查看指定波形详情。用法: /dglab waveinfo 波形名"""
+        target = (wave_name or "").strip()
+        if not target:
+            yield event.plain_result("请提供波形名。用法: /dglab waveinfo 波形名")
+            return
+
+        data = get_wave_data(target)
+        if not data:
+            yield event.plain_result(
+                f"未找到波形: {target}\n可用波形:\n{', '.join(get_wave_names())}"
+            )
+            return
+
+        first_frame = data[0] if data else ""
+        last_frame = data[-1] if data else ""
+        msg = (
+            f"波形: {target}\n"
+            f"帧数: {len(data)}\n"
+            f"总时长: {len(data) * 100}ms\n"
+            f"首帧: {first_frame}\n"
+            f"末帧: {last_frame}"
+        )
+        yield event.plain_result(msg)
 
     @dglab_group.command("fire")
     async def dglab_set_quick_fire_boost(self, event: AstrMessageEvent):

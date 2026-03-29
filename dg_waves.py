@@ -5,6 +5,8 @@
 """
 
 import random
+from pathlib import Path
+from typing import Optional
 
 # 预设波形 (V3 格式 - 8字节HEX)
 WAVE_PRESETS: dict[str, list[str]] = {
@@ -171,14 +173,213 @@ WAVE_NAME_MAP = {
 # 反向映射
 WAVE_NAME_MAP_REVERSE = {v: k for k, v in WAVE_NAME_MAP.items()}
 
+# 用户上传波形：键为波形名（文件名 stem），值为协议帧数组
+CUSTOM_WAVE_PRESETS: dict[str, list[str]] = {}
+
+
+def _normalize_strength(value: float) -> int:
+    return max(0, min(100, int(round(value))))
+
+
+def _convert_wave_frequency(input_freq: int) -> int:
+    """将输入频率(10-1000)换算为协议频率字节值(10-240)。"""
+    if 10 <= input_freq <= 100:
+        return input_freq
+    if 101 <= input_freq <= 600:
+        return ((input_freq - 100) // 5) + 100
+    if 601 <= input_freq <= 1000:
+        return ((input_freq - 600) // 10) + 200
+    return 10
+
+
+def _frame_to_hex(freqs: list[int], strengths: list[int]) -> str:
+    freq_hex = "".join(f"{value:02X}" for value in freqs)
+    strength_hex = "".join(f"{value:02X}" for value in strengths)
+    return f"{freq_hex}{strength_hex}"
+
+
+def parse_dungeonlab_pulse(content: str) -> list[str]:
+    """解析 DG-Lab App 导出的 .pulse 文件为协议帧数组。"""
+    content = content.strip()
+    if not content.startswith("Dungeonlab+pulse"):
+        return []
+
+    try:
+        _, rest = content.split(":", 1)
+    except ValueError:
+        return []
+
+    segments = rest.split("+section+")
+    strengths_all: list[float] = []
+    for seg in segments:
+        if "/" not in seg:
+            continue
+        _, data = seg.split("/", 1)
+        tokens = [t for t in data.split(",") if t.strip()]
+        for token in tokens:
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                val_str = token.split("-", 1)[0]
+                strengths_all.append(float(val_str))
+            except ValueError:
+                continue
+
+    if not strengths_all:
+        return []
+
+    pulse_frames: list[str] = []
+    protocol_freq = _convert_wave_frequency(80)
+    i = 0
+    while i < len(strengths_all):
+        group = strengths_all[i:i + 4]
+        if len(group) < 4:
+            group += [group[-1]] * (4 - len(group))
+
+        strengths = [_normalize_strength(v) for v in group]
+        freqs = [protocol_freq, protocol_freq, protocol_freq, protocol_freq]
+        pulse_frames.append(_frame_to_hex(freqs, strengths))
+        i += 4
+
+    return pulse_frames[:80]
+
+
+def clear_custom_waves() -> None:
+    """清空已加载的用户上传波形。"""
+    CUSTOM_WAVE_PRESETS.clear()
+
+
+def collect_uploaded_wave_paths(config, uploaded_wave_files_dir: Path) -> list[Path]:
+    """从 AstrBot 默认上传目录收集 uploaded_wave_files 对应文件。"""
+    raw_files = []
+    if hasattr(config, "get"):
+        raw_files = config.get("uploaded_wave_files", [])
+
+    if not isinstance(raw_files, list):
+        return []
+
+    file_names: list[str] = []
+    for item in raw_files:
+        if isinstance(item, str) and item.strip():
+            file_names.append(Path(item.strip()).name)
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        # 只取文件名，统一从默认上传目录读取。
+        for key in ("name", "filename", "path", "file_path", "filepath", "saved_path", "value"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                file_names.append(Path(value.strip()).name)
+                break
+
+    resolved_paths: list[Path] = []
+    for file_name in file_names:
+        if not file_name:
+            continue
+        file_path = (uploaded_wave_files_dir / file_name).resolve()
+        if file_path.exists() and file_path.is_file():
+            resolved_paths.append(file_path)
+
+    return resolved_paths
+
+
+def reload_uploaded_waves(config, uploaded_wave_files_dir: Path, logger) -> int:
+    """加载配置上传的 .pulse 波形文件。"""
+    try:
+        uploaded_paths = collect_uploaded_wave_paths(config, uploaded_wave_files_dir)
+        uploaded_wave_count = load_pulse_files(
+            uploaded_files=uploaded_paths,
+            logger=logger,
+        )
+        logger.info(f"用户上传波形加载完成，共 {uploaded_wave_count} 个")
+        return uploaded_wave_count
+    except Exception as e:
+        logger.error(f"加载用户上传波形失败: {e}")
+        return 0
+
+
+def _dedupe_custom_wave_name(base_name: str) -> str:
+    """避免与内置/已加载波形重名，返回可用名称。"""
+    candidate = base_name
+    index = 1
+    builtin_en_lower = {name.lower() for name in WAVE_NAME_MAP.keys()}
+    builtin_cn_lower = {name.lower() for name in WAVE_NAME_MAP_REVERSE.keys()} | {name.lower() for name in WAVE_PRESETS.keys()}
+
+    def _conflicted(name: str) -> bool:
+        lower_name = name.lower()
+        if lower_name in builtin_en_lower or lower_name in builtin_cn_lower:
+            return True
+        for custom_name in CUSTOM_WAVE_PRESETS.keys():
+            if custom_name.lower() == lower_name:
+                return True
+        return False
+
+    while (
+        _conflicted(candidate)
+    ):
+        candidate = f"{base_name}_{index}"
+        index += 1
+    return candidate
+
+
+def load_pulse_files(
+    uploaded_files: list[Path],
+    logger,
+) -> int:
+    """从上传文件列表加载 .pulse 波形并合并到用户波形集合。"""
+    clear_custom_waves()
+
+    loaded = 0
+    for src in uploaded_files:
+        if not src.exists() or not src.is_file():
+            logger.warning(f"上传波形文件不存在或不可读: {src}")
+            continue
+        if src.suffix.lower() != ".pulse":
+            logger.warning(f"跳过非 .pulse 文件: {src.name}")
+            continue
+
+        try:
+            text = src.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            logger.warning(f"读取 .pulse 文件失败: {src.name} - {e}")
+            continue
+
+        pulses = parse_dungeonlab_pulse(text)
+        if not pulses:
+            logger.warning(f"跳过空波形文件: {src.name}")
+            continue
+
+        preset_name = _dedupe_custom_wave_name(src.stem.strip() or "custom_wave")
+        CUSTOM_WAVE_PRESETS[preset_name] = pulses
+        loaded += 1
+        logger.info(f"已加载 .pulse 波形: {preset_name} ({len(pulses)} 帧)")
+
+    return loaded
+
+
+def _resolve_custom_wave_name(name: str) -> Optional[str]:
+    if name in CUSTOM_WAVE_PRESETS:
+        return name
+
+    lower_name = name.lower()
+    for custom_name in CUSTOM_WAVE_PRESETS.keys():
+        if custom_name.lower() == lower_name:
+            return custom_name
+    return None
+
 
 def get_wave_names() -> list[str]:
-    """获取所有波形名称（英文名）"""
-    return list(WAVE_NAME_MAP.keys())
+    """获取所有可用波形名称（内置英文名 + 用户上传名）。"""
+    names = list(WAVE_NAME_MAP.keys())
+    names.extend(sorted(CUSTOM_WAVE_PRESETS.keys()))
+    return names
 
 
 def get_wave_data(name: str) -> list[str]:
-    """根据名称获取波形数据，支持中英文名"""
+    """根据名称获取波形数据，支持内置中英文名与用户上传名。"""
     # 先尝试中文名
     if name in WAVE_PRESETS:
         return WAVE_PRESETS[name]
@@ -186,6 +387,10 @@ def get_wave_data(name: str) -> list[str]:
     cn_name = WAVE_NAME_MAP.get(name)
     if cn_name and cn_name in WAVE_PRESETS:
         return WAVE_PRESETS[cn_name]
+    # 尝试用户上传名
+    custom_name = _resolve_custom_wave_name(name)
+    if custom_name:
+        return CUSTOM_WAVE_PRESETS[custom_name]
     return []
 
 
@@ -225,10 +430,16 @@ def get_wave_model_reference_examples() -> str:
 
 
 def get_wave_descriptions() -> str:
-    """获取所有波形的描述性文字，供大模型参考"""
+    """获取所有波形（内置+用户上传）的描述性文字，供大模型参考。"""
     descriptions = []
     for en_name, cn_name in WAVE_NAME_MAP.items():
         data = WAVE_PRESETS.get(cn_name, [])
         duration_ms = len(data) * 100
         descriptions.append(f"- {en_name} ({cn_name}): 持续 {duration_ms}ms，共 {len(data)} 帧")
+
+    for custom_name in sorted(CUSTOM_WAVE_PRESETS.keys()):
+        data = CUSTOM_WAVE_PRESETS.get(custom_name, [])
+        duration_ms = len(data) * 100
+        descriptions.append(f"- {custom_name} : 持续 {duration_ms}ms，共 {len(data)} 帧")
+
     return "\n".join(descriptions)
