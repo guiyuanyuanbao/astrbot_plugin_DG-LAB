@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.0.0 - 2026-04-05
+
+### Added
+- 新增内置额度系统，包含独立 `billing.db` 数据库、免费额度与付费额度（发电额度）管理。
+- 新增爱发电订单兑换能力，支持通过 `/dglab redeem <order_id>` 将订单金额兑换为付费 TOKEN。
+- 新增管理员额度管理命令：`/dglab quota-list`、`/dglab redeem-list`、`/dglab recharge`。
+- 新增管理员免费额度刷新命令：`/dglab refresh-free user_id=123` 与 `/dglab refresh-free all=true`。
+- 新增 `afdian` 与 `billing` 配置对象，用于管理爱发电接口、刷新周期、兑换比例和模型倍率。
+
+### Changed
+- 插件版本提升至 `v2.0.0`。
+- 新增 `billing.enabled` 总开关，默认关闭；关闭时仅停用自动余额拦截与自动扣费链路。
+- 自动计费逻辑支持免费额度惰性刷新、免费优先扣费、群聊免计费和仅郊狼模式计费。
+- `help` 指令输出按普通用户命令与管理员命令分组整理，并同步补齐当前可用命令说明。
+
 ## v1.1.0 - 2026-03-29
 
 ### Added

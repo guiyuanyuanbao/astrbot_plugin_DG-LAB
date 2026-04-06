@@ -73,5 +73,106 @@
     "default": [],
     "file_types": ["pulse"],
     "hint": "支持上传多个 DG-Lab App 导出的 .pulse 波形文件，插件重载后会自动加载并与内置波形合并。"
+  },
+  "afdian": {
+    "description": "爱发电配置",
+    "type": "object",
+    "hint": "用于订单兑换查询的爱发电开放平台配置。",
+    "items": {
+      "base_url": {
+        "description": "爱发电 API 地址",
+        "type": "string",
+        "default": "https://afdian.com/api/open",
+        "hint": "通常保持默认即可。"
+      },
+      "user_id": {
+        "description": "爱发电 user_id",
+        "type": "string",
+        "default": "",
+        "hint": "爱发电开放平台的 user_id。"
+      },
+      "token": {
+        "description": "爱发电 token",
+        "type": "string",
+        "default": "",
+        "hint": "爱发电开放平台的 token。"
+      }
+    }
+  },
+  "billing": {
+    "description": "额度计费配置",
+    "type": "object",
+    "hint": "配置免费额度、刷新周期、兑换比例与 provider 倍率。",
+    "items": {
+      "enabled": {
+        "description": "开启计费",
+        "type": "bool",
+        "default": false,
+        "hint": "关闭后将跳过自动额度检查和扣费，但仍可使用兑换、充值、查询等命令。"
+      },
+      "free_quota_amount": {
+        "description": "免费额度",
+        "type": "int",
+        "default": 0,
+        "hint": "新用户首次命中和每次刷新时发放的免费 TOKEN。"
+      },
+      "free_refresh_hours": {
+        "description": "免费额度刷新小时数",
+        "type": "int",
+        "default": 24,
+        "hint": "惰性刷新周期，单位小时。"
+      },
+      "token_per_yuan": {
+        "description": "每元兑换 TOKEN",
+        "type": "int",
+        "default": 0,
+        "hint": "爱发电金额或管理员充值金额换算为 TOKEN 的比例。"
+      },
+      "charge_only_in_coyote_mode": {
+        "description": "仅郊狼模式计费",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，仅当前会话处于郊狼模式时才执行额度检查和扣费。"
+      },
+      "skip_group_chat_billing": {
+        "description": "群聊不计费",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，群聊消息会跳过额度检查和扣费。"
+      },
+      "insufficient_balance_reply": {
+        "description": "余额不足提示文案",
+        "type": "text",
+        "default": "当前额度不足，无法继续请求。",
+        "hint": "会在文案后自动附加免费额度、付费额度（发电额度）、总额度和下次刷新时间。"
+      },
+      "provider_multipliers": {
+        "description": "Provider 扣费倍率",
+        "type": "template_list",
+        "default": [],
+        "hint": "通过规则列表配置 provider 倍率。provider_id 选择大模型提供商，默认 1.0。",
+        "templates": {
+          "multiplier_rule": {
+            "name": "倍率规则",
+            "hint": "provider_id 选择大模型提供商，multiplier 填扣费倍率。",
+            "items": {
+              "provider_id": {
+                "description": "大模型提供商",
+                "type": "string",
+                "default": "",
+                "hint": "选择需要应用该倍率的大模型提供商。",
+                "_special": "select_provider"
+              },
+              "multiplier": {
+                "description": "倍率",
+                "type": "float",
+                "default": 1.0,
+                "hint": "扣费倍率，最小为 0，默认 1.0。"
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }

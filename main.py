@@ -1,17 +1,24 @@
 import asyncio
 import io
+import math
 import os
+import re
 import tempfile
+import time
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
+from .afdian_api import AfdianAPIClient, AfdianConfig
+from .billing_db import BillingDB, UserQuota
 from .dg_server import DGLabWSServer, DGLabController
 from .dg_waves import get_wave_descriptions, get_wave_names, get_wave_data, reload_uploaded_waves
 
@@ -56,7 +63,7 @@ class DGLabSession:
         return " | ".join(parts)
 
 
-@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "1.1.0")
+@register("astrbot_plugin_DG-LAB", "桂鸢", "DG-Lab 郊狼控制器插件：通过大模型对话控制郊狼脉冲主机", "2.0.0")
 class DGLabPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -76,9 +83,48 @@ class DGLabPlugin(Star):
             "郊狼模式开启失败：无法创建并切换郊狼人格，请检查人格配置。",
         )
         self._dglab_default_persona_id: str = self.config.get("dglab_default_persona_id", "")
+        afdian_cfg = self.config.get("afdian", {}) or {}
+        billing_cfg = self.config.get("billing", {}) or {}
+        self._afdian_client = AfdianAPIClient(
+            AfdianConfig(
+                base_url=str(
+                    afdian_cfg.get("base_url", "https://afdian.com/api/open")
+                    or "https://afdian.com/api/open"
+                ),
+                user_id=str(afdian_cfg.get("user_id", "") or ""),
+                token=str(afdian_cfg.get("token", "") or ""),
+            )
+        )
+        self._billing_free_quota_amount = max(
+            0, self._safe_int(billing_cfg.get("free_quota_amount", 0))
+        )
+        self._billing_free_refresh_hours = max(
+            0, self._safe_int(billing_cfg.get("free_refresh_hours", 24))
+        )
+        self._billing_token_per_yuan = max(
+            0, self._safe_int(billing_cfg.get("token_per_yuan", 0))
+        )
+        self._billing_enabled = bool(billing_cfg.get("enabled", False))
+        self._charge_only_in_coyote_mode = bool(
+            billing_cfg.get("charge_only_in_coyote_mode", True)
+        )
+        self._skip_group_chat_billing = bool(
+            billing_cfg.get("skip_group_chat_billing", False)
+        )
+        self._insufficient_balance_reply = str(
+            billing_cfg.get("insufficient_balance_reply", "当前额度不足，无法继续请求。")
+            or "当前额度不足，无法继续请求。"
+        )
+        self._billing_provider_multipliers = self._normalize_provider_multipliers(
+            billing_cfg.get("provider_multipliers", [])
+        )
         data_root = Path(get_astrbot_data_path())
         self._plugin_data_path: Path = data_root / "plugin_data" / "astrbot_plugin_DG_LAB"
         self._uploaded_wave_files_dir: Path = self._plugin_data_path / "files" / "uploaded_wave_files"
+        self._plugin_data_path.mkdir(parents=True, exist_ok=True)
+        self._billing_db_path: Path = self._plugin_data_path / "billing.db"
+        self._billing_db = BillingDB(self._billing_db_path)
+        self._billing_lock = asyncio.Lock()
         self._uploaded_wave_count: int = 0
         # 全局 WS 服务实例
         self._ws_server: Optional[DGLabWSServer] = None
@@ -94,6 +140,7 @@ class DGLabPlugin(Star):
 
     async def initialize(self):
         """插件初始化（WS 服务按郊狼模式启停）"""
+        self._plugin_data_path.mkdir(parents=True, exist_ok=True)
         logger.info(f"用户上传波形目录: {self._uploaded_wave_files_dir}")
         self._uploaded_wave_count = reload_uploaded_waves(
             config=self.config,
@@ -457,6 +504,268 @@ class DGLabPlugin(Star):
         except Exception as e:
             logger.error(f"删除人格失败({persona_id}): {e}")
 
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _format_time(timestamp: int | None) -> str:
+        if not timestamp:
+            return "-"
+        return datetime.fromtimestamp(int(timestamp)).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _normalize_provider_multipliers(raw_value: Any) -> dict[str, float]:
+        if not isinstance(raw_value, list):
+            return {}
+
+        normalized: dict[str, float] = {}
+
+        def add_multiplier(provider_id: Any, value: Any) -> None:
+            key_text = str(provider_id).strip()
+            if not key_text:
+                logger.warning("[DG-LAB] 忽略空倍率配置键")
+                return
+            try:
+                ratio = float(value)
+            except (TypeError, ValueError):
+                logger.warning(f"忽略无效倍率配置: {key_text}={value}")
+                return
+            if ratio < 0:
+                logger.warning(f"忽略负数倍率配置: {key_text}={value}")
+                return
+            normalized[key_text] = ratio
+
+        for item in raw_value:
+            if not isinstance(item, dict):
+                logger.warning(f"忽略无效倍率配置项: {item}")
+                continue
+            add_multiplier(item.get("provider_id", ""), item.get("multiplier"))
+
+        return normalized
+
+    @staticmethod
+    def _build_table(headers: list[str], rows: list[list[Any]]) -> str:
+        string_rows = [[str(cell) for cell in row] for row in rows]
+        widths = [len(header) for header in headers]
+        for row in string_rows:
+            for index, cell in enumerate(row):
+                widths[index] = max(widths[index], len(cell))
+
+        def format_row(values: list[str]) -> str:
+            return " | ".join(
+                value.ljust(widths[index]) for index, value in enumerate(values)
+            )
+
+        header_line = format_row(headers)
+        separator_line = "-+-".join("-" * width for width in widths)
+        body_lines = [format_row(row) for row in string_rows]
+        return "\n".join([header_line, separator_line, *body_lines])
+
+    @staticmethod
+    def _parse_key_value_args(text: str, prefixes: tuple[str, ...]) -> dict[str, str]:
+        remainder = text.strip()
+        for prefix in prefixes:
+            if remainder.startswith(prefix):
+                remainder = remainder[len(prefix) :].strip()
+                break
+
+        if not remainder:
+            return {}
+
+        parsed: dict[str, str] = {}
+        for part in remainder.split():
+            if "=" not in part:
+                raise ValueError("参数格式必须为 key=value。")
+            key, value = part.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if not key or not value:
+                raise ValueError("参数格式必须为 key=value。")
+            parsed[key] = value
+        return parsed
+
+    @staticmethod
+    def _extract_provider_id(provider: Any) -> str:
+        provider_config = getattr(provider, "provider_config", None)
+        if isinstance(provider_config, dict):
+            return str(provider_config.get("id", "") or "").strip()
+        return ""
+
+    def _get_billing_user_id(self, event: AstrMessageEvent) -> Optional[str]:
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None)
+        sender_id = getattr(sender, "user_id", None)
+        if sender_id:
+            return str(sender_id)
+
+        event_user_id = getattr(event, "user_id", None)
+        if event_user_id:
+            return str(event_user_id)
+
+        get_sender_id = getattr(event, "get_sender_id", None)
+        if callable(get_sender_id):
+            sender_value = get_sender_id()
+            if sender_value:
+                return str(sender_value)
+        return None
+
+    def _get_group_id(self, event: AstrMessageEvent) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        group_id = getattr(message_obj, "group_id", "") or ""
+        return str(group_id)
+
+    def _get_provider_multiplier(self, event: AstrMessageEvent) -> float:
+        try:
+            provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        except Exception as exc:
+            logger.debug(f"[DG-LAB] failed to get current provider: {exc}")
+            return 1.0
+
+        provider_id = self._extract_provider_id(provider)
+        if provider_id and provider_id in self._billing_provider_multipliers:
+            return self._billing_provider_multipliers[provider_id]
+        return 1.0
+
+    async def _should_charge_for_event(self, event: AstrMessageEvent) -> bool:
+        if not self._billing_enabled:
+            return False
+        if self._skip_group_chat_billing and self._get_group_id(event):
+            return False
+        if not self._charge_only_in_coyote_mode:
+            return True
+
+        session = await self.get_session_for_event(event.unified_msg_origin)
+        return bool(session and session.active)
+
+    async def _get_effective_user_quota(self, user_id: str) -> UserQuota:
+        async with self._billing_lock:
+            return self._billing_db.get_effective_user_quota(
+                user_id=user_id,
+                free_quota_amount=self._billing_free_quota_amount,
+                refresh_hours=self._billing_free_refresh_hours,
+                now_ts=int(time.time()),
+            )
+
+    def _get_next_refresh_timestamp(self, quota: UserQuota) -> int | None:
+        if self._billing_free_refresh_hours <= 0:
+            return None
+        return quota.last_refresh + self._billing_free_refresh_hours * 3600
+
+    def _build_quota_message(
+        self,
+        user_id: str,
+        quota: UserQuota,
+        prefix: str | None = None,
+    ) -> str:
+        next_refresh = self._get_next_refresh_timestamp(quota)
+        lines = []
+        if prefix:
+            lines.append(prefix)
+        lines.extend(
+            [
+                f"用户 ID: {user_id}",
+                f"免费额度: {quota.free_balance}",
+                f"发电额度: {quota.paid_balance}",
+                f"总额度: {quota.total_balance}",
+                f"上次刷新: {self._format_time(quota.last_refresh)}",
+                f"下次刷新: {self._format_time(next_refresh) if next_refresh else '未启用'}",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _build_insufficient_balance_message(
+        self, user_id: str, quota: UserQuota
+    ) -> str:
+        prefix = (self._insufficient_balance_reply or "").strip() or "当前额度不足，无法继续请求。"
+        return self._build_quota_message(user_id=user_id, quota=quota, prefix=prefix)
+
+    @staticmethod
+    def _extract_total_tokens(resp: LLMResponse) -> int:
+        raw_completion = getattr(resp, "raw_completion", None)
+        usage = getattr(raw_completion, "usage", None)
+        if usage is None:
+            return 0
+        total_tokens = getattr(usage, "total_tokens", None)
+        if total_tokens is not None:
+            return max(0, int(total_tokens or 0))
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        return max(0, prompt_tokens + completion_tokens)
+
+    def _extract_order_amount(self, order: dict[str, Any]) -> float:
+        if "show_amount" in order and order.get("show_amount") not in (None, ""):
+            return self._safe_float(order.get("show_amount"))
+        return self._safe_float(order.get("total_amount"))
+
+    def _tokens_from_amount(self, amount: float) -> int:
+        return max(0, math.floor(amount * self._billing_token_per_yuan))
+
+    @staticmethod
+    def _parse_manual_order_id(order_id: str) -> tuple[str, str, str] | None:
+        matched = re.match(r"^manual:([^:]+):([^:]+):(\d+)$", order_id)
+        if not matched:
+            return None
+        return matched.group(1), matched.group(2), matched.group(3)
+
+    async def _render_text_image(self, event: AstrMessageEvent, text: str):
+        image = await self.text_to_image(text)
+        return event.image_result(image)
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        del req
+        user_id = self._get_billing_user_id(event)
+        if not user_id:
+            return
+        if not await self._should_charge_for_event(event):
+            return
+
+        quota = await self._get_effective_user_quota(user_id)
+        if quota.total_balance > 0:
+            return
+
+        await event.send(event.plain_result(self._build_insufficient_balance_message(user_id, quota)))
+        event.stop_event()
+
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
+        user_id = self._get_billing_user_id(event)
+        if not user_id:
+            return
+        if not await self._should_charge_for_event(event):
+            return
+
+        total_tokens = self._extract_total_tokens(resp)
+        multiplier = self._get_provider_multiplier(event)
+        charge_amount = max(0, math.floor(total_tokens * multiplier))
+        if charge_amount <= 0:
+            return
+
+        async with self._billing_lock:
+            charge_result = self._billing_db.apply_usage_charge(
+                user_id=user_id,
+                amount=charge_amount,
+                free_quota_amount=self._billing_free_quota_amount,
+                refresh_hours=self._billing_free_refresh_hours,
+                now_ts=int(time.time()),
+            )
+        logger.debug(
+            f"[DG-LAB] charged user={user_id} tokens={total_tokens} "
+            f"multiplier={multiplier} free={charge_result.charged_free} "
+            f"paid={charge_result.charged_paid}"
+        )
+
     @filter.command_group("dglab")
     def dglab_group(self):
         """郊狼指令组"""
@@ -466,19 +775,384 @@ class DGLabPlugin(Star):
     async def dglab_help(self, event: AstrMessageEvent):
         """查看郊狼指令帮助"""
         help_text = (
-            "郊狼指令组用法:\n"
+            "DG-LAB 指令帮助\n"
+            "\n"
+            "普通用户命令:\n"
+            "/dglab help - 查看本帮助\n"
             "/dglab start - 开启郊狼模式并生成绑定二维码\n"
             "/dglab stop - 退出郊狼模式\n"
             "/dglab status - 查看当前郊狼状态\n"
-            "/dglab wavelist - 查看当前可用波形列表\n"
-            "/dglab waveinfo 波形名 - 查看指定波形详细信息\n"
             "/dglab channel A|B|AB - 设置使用通道\n"
             "/dglab part A:部位 B:部位 - 设置通道部位\n"
-            "/dglab fire [强度] 或 /dglab fire A:强度 B:强度 - 设置一键开火临时增量(默认1, 最大30)\n"
+            "/dglab fire <强度> 或 /dglab fire A:<强度> B:<强度> - 设置一键开火临时增量\n"
             "/dglab persona - 查看当前郊狼人格配置与状态\n"
-            "/dglab help - 查看本帮助"
+            "/dglab quota - 查看当前额度\n"
+            "/dglab redeem <订单号> - 兑换爱发电订单\n"
+            "/dglab wavelist - 查看当前可用波形列表\n"
+            "/dglab waveinfo <波形名> - 查看指定波形详细信息\n"
+            "\n"
+            "管理员命令:\n"
+            "/dglab quota-list [user_id=xxx] [limit=50] - 查看额度记录\n"
+            "/dglab redeem-list [user_id=xxx] [order_id=xxx] [limit=50] - 查看充值记录\n"
+            "/dglab recharge user_id=123 amount=6.66 - 手动为指定用户充值\n"
+            "/dglab refresh-free user_id=123 - 立即刷新指定用户免费额度\n"
+            "/dglab refresh-free all=true - 立即刷新全体已有额度记录用户的免费额度"
         )
         yield event.plain_result(help_text)
+
+    @dglab_group.command("quota", alias={"额度"})
+    async def dglab_quota(self, event: AstrMessageEvent):
+        """查看当前用户额度"""
+        user_id = self._get_billing_user_id(event)
+        if not user_id:
+            yield event.plain_result("未能识别当前用户 ID。")
+            return
+
+        quota = await self._get_effective_user_quota(user_id)
+        yield event.plain_result(self._build_quota_message(user_id, quota))
+
+    @dglab_group.command("redeem", alias={"兑换"})
+    async def dglab_redeem(self, event: AstrMessageEvent, order_id: str = ""):
+        """兑换爱发电订单"""
+        order_id = (order_id or "").strip()
+        if not order_id:
+            yield event.plain_result("请提供订单号，例如：/dglab redeem 订单号")
+            return
+        if not self._afdian_client.is_configured:
+            yield event.plain_result("爱发电 API 未配置完整，暂时无法兑换订单。")
+            return
+        if self._billing_token_per_yuan <= 0:
+            yield event.plain_result("当前每元兑换 TOKEN 配置无效，无法进行订单兑换。")
+            return
+
+        user_id = self._get_billing_user_id(event)
+        if not user_id:
+            yield event.plain_result("未能识别当前用户 ID。")
+            return
+
+        try:
+            orders = await self._afdian_client.query_order(out_trade_no=order_id)
+        except RuntimeError as exc:
+            yield event.plain_result(f"查询订单失败：{exc}")
+            return
+
+        target_order = None
+        for order in orders:
+            if str(order.get("out_trade_no", "") or "") == order_id:
+                target_order = order
+                break
+        if target_order is None and orders:
+            target_order = orders[0]
+        if target_order is None:
+            yield event.plain_result("未找到该订单。")
+            return
+
+        if self._safe_int(target_order.get("status"), 0) != 2:
+            yield event.plain_result("该订单未支付成功，暂时不能兑换。")
+            return
+
+        amount = self._extract_order_amount(target_order)
+        paid_balance = self._tokens_from_amount(amount)
+        if paid_balance <= 0:
+            yield event.plain_result("当前兑换比例对应的 TOKEN 数为 0，无法兑换。")
+            return
+
+        try:
+            async with self._billing_lock:
+                quota = self._billing_db.record_redeem(
+                    order_id=order_id,
+                    user_id=user_id,
+                    amount=amount,
+                    paid_balance=paid_balance,
+                    source="afdian",
+                    free_quota_amount=self._billing_free_quota_amount,
+                    refresh_hours=self._billing_free_refresh_hours,
+                    now_ts=int(time.time()),
+                )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+
+        yield event.plain_result(
+            "\n".join(
+                [
+                    "兑换成功。",
+                    f"订单号: {order_id}",
+                    f"兑换金额: {amount:.2f} 元",
+                    f"到账 TOKEN: {paid_balance}",
+                    f"当前发电额度: {quota.paid_balance}",
+                    f"当前总额度: {quota.total_balance}",
+                ]
+            )
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @dglab_group.command("quota-list", alias={"额度列表"})
+    async def dglab_quota_list(self, event: AstrMessageEvent):
+        """管理员查看额度列表"""
+        try:
+            args = self._parse_key_value_args(
+                event.message_str,
+                prefixes=(
+                    "/dglab quota-list",
+                    "dglab quota-list",
+                    "/dglab 额度列表",
+                    "dglab 额度列表",
+                ),
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"参数错误：{exc}")
+            return
+
+        user_id = args.get("user_id")
+        limit = None
+        if "limit" in args:
+            limit = self._safe_int(args.get("limit"), -1)
+            if limit <= 0:
+                yield event.plain_result("limit 必须是大于 0 的整数。")
+                return
+
+        async with self._billing_lock:
+            quotas = self._billing_db.list_user_quotas(user_id=user_id, limit=limit)
+
+        if not quotas:
+            yield event.plain_result("没有找到额度记录。")
+            return
+
+        rows = [
+            [
+                quota.user_id,
+                quota.free_balance,
+                quota.paid_balance,
+                quota.total_balance,
+                self._format_time(quota.last_refresh),
+                self._format_time(self._get_next_refresh_timestamp(quota))
+                if self._get_next_refresh_timestamp(quota)
+                else "未启用",
+            ]
+            for quota in quotas
+        ]
+        text = "额度记录\n\n" + self._build_table(
+            ["用户ID", "免费额度", "发电额度", "总额度", "上次刷新", "下次刷新"],
+            rows,
+        )
+        yield await self._render_text_image(event, text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @dglab_group.command("redeem-list", alias={"兑换记录"})
+    async def dglab_redeem_list(self, event: AstrMessageEvent):
+        """管理员查看充值记录"""
+        try:
+            args = self._parse_key_value_args(
+                event.message_str,
+                prefixes=(
+                    "/dglab redeem-list",
+                    "dglab redeem-list",
+                    "/dglab 兑换记录",
+                    "dglab 兑换记录",
+                ),
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"参数错误：{exc}")
+            return
+
+        user_id = args.get("user_id")
+        order_id = args.get("order_id")
+        limit = None
+        if "limit" in args:
+            limit = self._safe_int(args.get("limit"), -1)
+            if limit <= 0:
+                yield event.plain_result("limit 必须是大于 0 的整数。")
+                return
+
+        async with self._billing_lock:
+            orders = self._billing_db.list_redeemed_orders(
+                user_id=user_id,
+                order_id=order_id,
+                limit=limit,
+            )
+
+        if not orders:
+            yield event.plain_result("没有找到充值记录。")
+            return
+
+        rows = []
+        for order in orders:
+            parsed = self._parse_manual_order_id(str(order["order_id"]))
+            admin_id = parsed[0] if parsed else "-"
+            rows.append(
+                [
+                    str(order["order_id"]),
+                    str(order["user_id"]),
+                    f'{float(order["amount"]):.2f}',
+                    int(order["paid_balance"]),
+                    str(order["source"]),
+                    admin_id,
+                    self._format_time(int(order["redeem_time"])),
+                ]
+            )
+        text = "充值记录\n\n" + self._build_table(
+            ["订单号", "用户ID", "金额(元)", "TOKEN", "来源", "管理员ID", "兑换时间"],
+            rows,
+        )
+        yield await self._render_text_image(event, text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @dglab_group.command("recharge", alias={"手动充值"})
+    async def dglab_recharge(self, event: AstrMessageEvent):
+        """管理员手动充值"""
+        try:
+            args = self._parse_key_value_args(
+                event.message_str,
+                prefixes=(
+                    "/dglab recharge",
+                    "dglab recharge",
+                    "/dglab 手动充值",
+                    "dglab 手动充值",
+                ),
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"参数错误：{exc}")
+            return
+
+        target_user_id = (args.get("user_id") or "").strip()
+        if not target_user_id:
+            yield event.plain_result("请提供 user_id，例如：/dglab recharge user_id=123 amount=6.66")
+            return
+
+        amount_text = args.get("amount")
+        if amount_text is None:
+            yield event.plain_result("请提供 amount，例如：/dglab recharge user_id=123 amount=6.66")
+            return
+
+        amount = self._safe_float(amount_text, -1)
+        if amount <= 0:
+            yield event.plain_result("amount 必须是大于 0 的数字。")
+            return
+
+        if self._billing_token_per_yuan <= 0:
+            yield event.plain_result("当前每元兑换 TOKEN 配置无效，无法手动充值。")
+            return
+
+        paid_balance = self._tokens_from_amount(amount)
+        if paid_balance <= 0:
+            yield event.plain_result("当前兑换比例对应的 TOKEN 数为 0，无法充值。")
+            return
+
+        admin_id = self._get_billing_user_id(event) or "unknown"
+        manual_order_id = f"manual:{admin_id}:{target_user_id}:{int(time.time() * 1000)}"
+
+        try:
+            async with self._billing_lock:
+                quota = self._billing_db.record_redeem(
+                    order_id=manual_order_id,
+                    user_id=target_user_id,
+                    amount=amount,
+                    paid_balance=paid_balance,
+                    source="manual_admin",
+                    free_quota_amount=self._billing_free_quota_amount,
+                    refresh_hours=self._billing_free_refresh_hours,
+                    now_ts=int(time.time()),
+                )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+
+        yield event.plain_result(
+            "\n".join(
+                [
+                    "手动充值成功。",
+                    f"目标用户: {target_user_id}",
+                    f"充值金额: {amount:.2f} 元",
+                    f"到账 TOKEN: {paid_balance}",
+                    f"记录订单号: {manual_order_id}",
+                    f"当前发电额度: {quota.paid_balance}",
+                    f"当前总额度: {quota.total_balance}",
+                ]
+            )
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @dglab_group.command("refresh-free", alias={"刷新免费额度"})
+    async def dglab_refresh_free(self, event: AstrMessageEvent):
+        """管理员立即刷新免费额度"""
+        try:
+            args = self._parse_key_value_args(
+                event.message_str,
+                prefixes=(
+                    "/dglab refresh-free",
+                    "dglab refresh-free",
+                    "/dglab 刷新免费额度",
+                    "dglab 刷新免费额度",
+                ),
+            )
+        except ValueError as exc:
+            yield event.plain_result(f"参数错误：{exc}")
+            return
+
+        user_id = (args.get("user_id") or "").strip()
+        all_flag = (args.get("all") or "").strip().lower()
+
+        if all_flag and all_flag != "true":
+            yield event.plain_result("参数错误：`all` 只支持 `true`。")
+            return
+
+        if user_id and all_flag == "true":
+            yield event.plain_result("参数错误：`user_id` 和 `all=true` 不能同时传入。")
+            return
+
+        if user_id:
+            now_ts = int(time.time())
+            try:
+                async with self._billing_lock:
+                    quota = self._billing_db.refresh_user_free_quota(
+                        user_id=user_id,
+                        free_quota_amount=self._billing_free_quota_amount,
+                        now_ts=now_ts,
+                    )
+            except ValueError as exc:
+                yield event.plain_result(str(exc))
+                return
+
+            yield event.plain_result(
+                "\n".join(
+                    [
+                        "免费额度刷新成功。",
+                        f"目标用户: {quota.user_id}",
+                        f"免费额度: {quota.free_balance}",
+                        f"发电额度: {quota.paid_balance}",
+                        f"总额度: {quota.total_balance}",
+                        f"刷新时间: {self._format_time(quota.last_refresh)}",
+                    ]
+                )
+            )
+            return
+
+        if not all_flag:
+            yield event.plain_result("参数错误：请提供 `user_id=xxx` 或 `all=true`。")
+            return
+
+        now_ts = int(time.time())
+        async with self._billing_lock:
+            refreshed_count = self._billing_db.refresh_all_users_free_quota(
+                free_quota_amount=self._billing_free_quota_amount,
+                now_ts=now_ts,
+            )
+
+        if refreshed_count <= 0:
+            yield event.plain_result("没有可刷新的额度记录。")
+            return
+
+        yield event.plain_result(
+            "\n".join(
+                [
+                    "全体免费额度刷新成功。",
+                    f"刷新人数: {refreshed_count}",
+                    f"免费额度: {self._billing_free_quota_amount}",
+                    f"刷新时间: {self._format_time(now_ts)}",
+                ]
+            )
+        )
 
     @dglab_group.command("wavelist", alias={"波形列表"})
     async def dglab_wavelist(self, event: AstrMessageEvent):
@@ -938,3 +1612,4 @@ class DGLabPlugin(Star):
         # 关闭 WS 服务
         await self._stop_server_if_idle()
         await self._delete_shared_dglab_persona_if_idle()
+        await self._afdian_client.close()
